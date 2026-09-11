@@ -1,0 +1,1976 @@
+@@@ /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/offloading/metrics.py
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from dataclasses import dataclass
+from typing import Any
+
+from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorPromMetrics,
+    KVConnectorStats,
+    PromMetric,
+    PromMetricT,
+)
+from vllm.v1.kv_offload.base import (
+    OffloadingCounterMetadata,
+    OffloadingGaugeMetadata,
+    OffloadingHistogramMetadata,
+    OffloadingMetricMetadata,
+)
+from vllm.v1.kv_offload.factory import OffloadingSpecFactory
+
+
+class _TransferMetricName:
+    """Flat metric names for GPU↔offload-medium transfer operations."""
+
+    LOAD_BYTES = "vllm:kv_offload_load_bytes"
+    LOAD_TIME = "vllm:kv_offload_load_time"
+    LOAD_SIZE = "vllm:kv_offload_load_size"
+    STORE_BYTES = "vllm:kv_offload_store_bytes"
+    STORE_TIME = "vllm:kv_offload_store_time"
+    STORE_SIZE = "vllm:kv_offload_store_size"
+
+
+class _ConnectorMetricName:
+    """Connector-side metrics emitted by scheduler-side offloading code."""
+
+    LOOKUP_SYNC_DELAY = "vllm:kv_offload_lookup_sync_delay_seconds"
+    LOOKUP_ASYNC_DELAY = "vllm:kv_offload_lookup_async_delay_seconds"
+    ALLOCATION_FAILURE = "vllm:kv_offload_allocation_failure"
+
+
+class _TransferType:
+    """Transfer direction labels for deprecated CPU offload metrics."""
+
+    LOAD = "CPU_to_GPU"
+    STORE = "GPU_to_CPU"
+    ALL = (LOAD, STORE)
+
+
+TRANSFER_SIZE_BUCKETS = (
+    1e6,
+    5e6,
+    10e6,
+    20e6,
+    40e6,
+    60e6,
+    80e6,
+    100e6,
+    150e6,
+    200e6,
+)
+
+
+def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
+    return {
+        _TransferMetricName.LOAD_BYTES: OffloadingCounterMetadata(
+            documentation="Total bytes loaded from offload storage to GPU.",
+        ),
+        _TransferMetricName.LOAD_TIME: OffloadingCounterMetadata(
+            documentation="Total load time from offload storage to GPU, in seconds.",
+        ),
+        _TransferMetricName.LOAD_SIZE: OffloadingHistogramMetadata(
+            documentation="Histogram of KV offload load operation size, in bytes.",
+            buckets=TRANSFER_SIZE_BUCKETS,
+        ),
+        _TransferMetricName.STORE_BYTES: OffloadingCounterMetadata(
+            documentation="Total bytes stored from GPU to offload storage.",
+        ),
+        _TransferMetricName.STORE_TIME: OffloadingCounterMetadata(
+            documentation="Total store time from GPU to offload storage, in seconds.",
+        ),
+        _TransferMetricName.STORE_SIZE: OffloadingHistogramMetadata(
+            documentation="Histogram of KV offload store operation size, in bytes.",
+            buckets=TRANSFER_SIZE_BUCKETS,
+        ),
+        _ConnectorMetricName.LOOKUP_SYNC_DELAY: OffloadingHistogramMetadata(
+            documentation=(
+                "Histogram of the time spent in a single offload lookup call, "
+                "in seconds."
+            ),
+            buckets=(
+                0.00001,
+                0.00005,
+                0.0001,
+                0.0005,
+                0.001,
+                0.005,
+                0.01,
+                0.05,
+                0.1,
+                0.5,
+                1,
+            ),
+        ),
+        _ConnectorMetricName.LOOKUP_ASYNC_DELAY: OffloadingHistogramMetadata(
+            documentation=(
+                "Histogram of time between a request's offload lookup first "
+                "deferring and the following lookup resolving, or request "
+                "finish, in seconds."
+            ),
+            buckets=(
+                0.0001,
+                0.0005,
+                0.001,
+                0.005,
+                0.01,
+                0.05,
+                0.1,
+                0.5,
+                1,
+                5,
+                10,
+            ),
+        ),
+        _ConnectorMetricName.ALLOCATION_FAILURE: OffloadingCounterMetadata(
+            documentation=(
+                "Number of KV offload store allocation attempts that failed."
+            ),
+        ),
+    }
+
+
+_DEPRECATED_TOTAL_BYTES = "vllm:kv_offload_total_bytes"
+_DEPRECATED_TOTAL_TIME = "vllm:kv_offload_total_time"
+_DEPRECATED_SIZE = "vllm:kv_offload_size"
+
+# Deprecated legacy transfer metrics, kept during the migration to the flat
+# metric names above. These stay in a separate definition block because they
+# use a transfer_type label, but are emitted from the same flat stats payload
+# for compatibility.
+_DEPRECATED_CONNECTOR_METRIC_DEFINITIONS: dict[str, OffloadingMetricMetadata] = {
+    _DEPRECATED_TOTAL_BYTES: OffloadingCounterMetadata(
+        documentation="Number of bytes offloaded by KV connector",
+    ),
+    _DEPRECATED_TOTAL_TIME: OffloadingCounterMetadata(
+        documentation="Total time measured by all KV offloading operations",
+    ),
+    _DEPRECATED_SIZE: OffloadingHistogramMetadata(
+        documentation="Histogram of KV offload transfer size, in bytes.",
+        buckets=TRANSFER_SIZE_BUCKETS,
+    ),
+}
+
+
+class _MetricType:
+    """Type tags embedded in the serialized stats payload."""
+
+    COUNTER = "counter"
+    GAUGE = "gauge"
+    HISTOGRAM = "histogram"
+
+
+class _StatsKey:
+    """Top-level keys in the serialized stats dict."""
+
+    # Maps metric name -> _MetricType value
+    TYPES = "types"
+    # Maps metric name -> {label values tuple -> observed value (number or list)}
+    DATA = "data"
+
+
+@dataclass
+class OffloadingConnectorStats(KVConnectorStats):
+    """
+    Offloading connector stats use flat metric names as keys.
+
+    The ``data`` dict is structured using ``_StatsKey`` / ``_MetricType``::
+
+        {
+            _StatsKey.TYPES: {name: _MetricType.*, ...},
+            _StatsKey.DATA:  {name: {labelvalues: value, ...}, ...},
+        }
+
+    This structure is self-describing: it survives IPC serialization
+    without needing the full ``OffloadingMetricMetadata`` objects on the
+    receiving side.
+
+    Counter values are aggregated by summing per-label-tuple, gauge values
+    use the latest snapshot per-label-tuple, and histogram values are lists of
+    observed samples per-label-tuple. Unlabeled metrics use ``()`` as their
+    labelvalues tuple.
+    """
+
+    def __post_init__(self):
+        if _StatsKey.DATA not in self.data:
+            self.reset()
+
+    def reset(self):
+        self.data: dict[str, Any] = {
+            _StatsKey.TYPES: {},
+            _StatsKey.DATA: {},
+        }
+
+    @property
+    def _types(self) -> dict[str, str]:
+        return self.data[_StatsKey.TYPES]
+
+    @property
+    def _values(self) -> dict[str, Any]:
+        return self.data[_StatsKey.DATA]
+
+    def aggregate(self, other: "KVConnectorStats") -> "KVConnectorStats":
+        if other.is_empty():
+            return self
+        assert isinstance(other, OffloadingConnectorStats)
+        other_types = other._types
+        other_values = other._values
+        for key, other_label_values in other_values.items():
+            type_str = other_types.get(key)
+            if type_str is None:
+                raise AssertionError(f"Unknown offloading stats key: {key}")
+            self._types.setdefault(key, type_str)
+            current_label_values = self._values.setdefault(key, {})
+            for labelvalues, value in other_label_values.items():
+                if type_str == _MetricType.HISTOGRAM:
+                    assert isinstance(value, list)
+                    if labelvalues not in current_label_values:
+                        current_label_values[labelvalues] = list(value)
+                    else:
+                        assert isinstance(current_label_values[labelvalues], list)
+                        current_label_values[labelvalues].extend(value)
+                elif type_str == _MetricType.COUNTER:
+                    assert isinstance(value, int | float)
+                    current_label_values[labelvalues] = (
+                        current_label_values.get(labelvalues, 0) + value
+                    )
+                elif type_str == _MetricType.GAUGE:
+                    assert isinstance(value, int | float)
+                    current_label_values[labelvalues] = value
+                else:
+                    raise AssertionError(
+                        f"Unknown metric type '{type_str}' for key: {key}"
+                    )
+        return self
+
+    def reduce(self) -> dict[str, int | float]:
+        """
+        Reduce the observations collected during a time interval to one or
+        more representative values (eg avg/median/sum of the series).
+        This is meant to be called by the logger to produce a summary of the
+        stats for the last time interval.
+        """
+        return_dict: dict[str, int | float] = {}
+        for key, label_value_map in self._values.items():
+            type_str = self._types.get(key)
+            if type_str is None:
+                raise AssertionError(f"Unknown offloading stats key: {key}")
+            for labelvalues, value in label_value_map.items():
+                key_with_labels = f"{key}:{labelvalues}" if labelvalues else key
+                if type_str == _MetricType.HISTOGRAM:
+                    assert isinstance(value, list)
+                    return_dict[f"{key_with_labels}_count"] = len(value)
+                    return_dict[f"{key_with_labels}_sum"] = sum(value)
+                elif type_str in (_MetricType.COUNTER, _MetricType.GAUGE):
+                    assert isinstance(value, int | float)
+                    return_dict[key_with_labels] = value
+                else:
+                    raise AssertionError(
+                        f"Unknown metric type '{type_str}' for key: {key}"
+                    )
+        return return_dict
+
+    def is_empty(self) -> bool:
+        return not self.data.get(_StatsKey.DATA)
+
+    def increase_counter(
+        self,
+        counter_name: str,
+        counter_increase_value: int | float = 1,
+        labelvalues: tuple[str, ...] = (),
+    ) -> None:
+        """Increase a counter on the stats payload."""
+        self._types.setdefault(counter_name, _MetricType.COUNTER)
+        counter_values = self._values.setdefault(counter_name, {})
+        counter_values[labelvalues] = (
+            counter_values.get(labelvalues, 0) + counter_increase_value
+        )
+
+    def set_gauge(
+        self,
+        gauge_name: str,
+        gauge_value: int | float,
+        labelvalues: tuple[str, ...] = (),
+    ) -> None:
+        """Set a gauge snapshot on the stats payload."""
+        self._types.setdefault(gauge_name, _MetricType.GAUGE)
+        gauge_values = self._values.setdefault(gauge_name, {})
+        gauge_values[labelvalues] = gauge_value
+
+    def observe_histogram(
+        self,
+        histogram_name: str,
+        histogram_value: int | float,
+        labelvalues: tuple[str, ...] = (),
+    ) -> None:
+        """Record a histogram observation on the stats payload."""
+        self._types.setdefault(histogram_name, _MetricType.HISTOGRAM)
+        histogram_values = self._values.setdefault(histogram_name, {})
+        histogram_values.setdefault(labelvalues, []).append(histogram_value)
+
+
+class OffloadPromMetrics(KVConnectorPromMetrics):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ):
+        super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
+        # (engine_idx, transfer_type) -> (metric with bounded labels)
+        self.histogram_transfer_size: dict[tuple[int, str], PromMetricT] = {}
+        self.counter_kv_bytes: dict[tuple[int, str], PromMetricT] = {}
+        self.counter_kv_transfer_time: dict[tuple[int, str], PromMetricT] = {}
+        kv_transfer_config = vllm_config.kv_transfer_config
+        assert kv_transfer_config is not None
+        extra_config = kv_transfer_config.kv_connector_extra_config
+        spec_cls = OffloadingSpecFactory.get_spec_cls(extra_config)
+        self._offloading_metric_metadata: dict[str, OffloadingMetricMetadata] = {
+            **spec_cls.build_metric_definitions(extra_config),
+            **get_connector_metric_definitions(),
+        }
+        from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+
+        self._observe_deprecated_metrics = issubclass(spec_cls, CPUOffloadingSpec)
+        self._offloading_metric_defs: dict[str, PromMetricT] = {}
+        # (engine_idx, metric_name, labelvalues) -> metric with bound labels
+        self.offloading_metrics: dict[
+            tuple[int, str, tuple[str, ...]], PromMetricT
+        ] = {}
+
+        self._counter_kv_bytes = self._counter_cls(
+            name=_DEPRECATED_TOTAL_BYTES,
+            documentation=_DEPRECATED_CONNECTOR_METRIC_DEFINITIONS[
+                _DEPRECATED_TOTAL_BYTES
+            ].documentation,
+            labelnames=labelnames + ["transfer_type"],
+        )
+
+        self._counter_kv_transfer_time = self._counter_cls(
+            name=_DEPRECATED_TOTAL_TIME,
+            documentation=_DEPRECATED_CONNECTOR_METRIC_DEFINITIONS[
+                _DEPRECATED_TOTAL_TIME
+            ].documentation,
+            labelnames=labelnames + ["transfer_type"],
+        )
+
+        deprecated_size_metadata = _DEPRECATED_CONNECTOR_METRIC_DEFINITIONS[
+            _DEPRECATED_SIZE
+        ]
+        assert isinstance(deprecated_size_metadata, OffloadingHistogramMetadata)
+        self._histogram_transfer_size = self._histogram_cls(
+            name=_DEPRECATED_SIZE,
+            documentation=deprecated_size_metadata.documentation,
+            buckets=deprecated_size_metadata.buckets,
+            labelnames=labelnames + ["transfer_type"],
+        )
+
+        for engine_idx, labelvalues in per_engine_labelvalues.items():
+            for transfer_type in _TransferType.ALL:
+                bounded_labelvalues = labelvalues + [transfer_type]
+                self.histogram_transfer_size[(engine_idx, transfer_type)] = (
+                    self._histogram_transfer_size.labels(*bounded_labelvalues)
+                )
+                self.counter_kv_bytes[(engine_idx, transfer_type)] = (
+                    self._counter_kv_bytes.labels(*bounded_labelvalues)
+                )
+                self.counter_kv_transfer_time[(engine_idx, transfer_type)] = (
+                    self._counter_kv_transfer_time.labels(*bounded_labelvalues)
+                )
+
+        for metric_name, metadata in self._offloading_metric_metadata.items():
+            self._offloading_metric_defs[metric_name] = self._create_metric(
+                metric_name, metadata
+            )
+
+    def _create_metric(
+        self, metric_name: str, metadata: OffloadingMetricMetadata
+    ) -> Any:
+        kwargs: dict[str, Any] = {
+            "name": metric_name,
+            "documentation": metadata.documentation,
+            "labelnames": self._labelnames + list(metadata.labelnames),
+        }
+        if isinstance(metadata, OffloadingCounterMetadata):
+            metric_cls = self._counter_cls
+        elif isinstance(metadata, OffloadingGaugeMetadata):
+            metric_cls = self._gauge_cls
+        elif isinstance(metadata, OffloadingHistogramMetadata):
+            metric_cls = self._histogram_cls
+            if metadata.buckets is not None:
+                kwargs["buckets"] = metadata.buckets
+        else:
+            raise AssertionError(f"Unknown offloading metric metadata: {metadata}")
+        return metric_cls(**kwargs)
+
+    def _get_prometheus_metric(
+        self,
+        metric_name: str,
+        labelvalues: tuple[str, ...],
+        engine_idx: int,
+    ) -> PromMetric:
+        metadata = self._offloading_metric_metadata[metric_name]
+        if len(labelvalues) != len(metadata.labelnames):
+            raise AssertionError(
+                f"Metric {metric_name} expects {len(metadata.labelnames)} labels, "
+                f"got {len(labelvalues)}"
+            )
+        key = (engine_idx, metric_name, labelvalues)
+        prom_metric = self.offloading_metrics.get(key)
+        if prom_metric is None:
+            engine_labelvalues = self.per_engine_labelvalues[engine_idx]
+            prom_metric = self._offloading_metric_defs[metric_name].labels(
+                *(engine_labelvalues + list(labelvalues))
+            )
+            self.offloading_metrics[key] = prom_metric
+        return prom_metric
+
+    def _increase_counter(
+        self,
+        metric_name: str,
+        value: int | float,
+        labelvalues: tuple[str, ...],
+        engine_idx: int,
+    ) -> None:
+        self._get_prometheus_metric(metric_name, labelvalues, engine_idx).inc(value)
+        if labelvalues or not self._observe_deprecated_metrics:
+            return
+        # Keep deprecated CPU offload transfer metrics updated during the
+        # transition to flat metric names.
+        if metric_name == _TransferMetricName.LOAD_BYTES:
+            self.counter_kv_bytes[(engine_idx, _TransferType.LOAD)].inc(value)
+        elif metric_name == _TransferMetricName.LOAD_TIME:
+            self.counter_kv_transfer_time[(engine_idx, _TransferType.LOAD)].inc(value)
+        elif metric_name == _TransferMetricName.STORE_BYTES:
+            self.counter_kv_bytes[(engine_idx, _TransferType.STORE)].inc(value)
+        elif metric_name == _TransferMetricName.STORE_TIME:
+            self.counter_kv_transfer_time[(engine_idx, _TransferType.STORE)].inc(value)
+
+    def _set_gauge(
+        self,
+        metric_name: str,
+        value: int | float,
+        labelvalues: tuple[str, ...],
+        engine_idx: int,
+    ) -> None:
+        self._get_prometheus_metric(metric_name, labelvalues, engine_idx).set(value)
+
+    def _observe_histogram(
+        self,
+        metric_name: str,
+        value: list[int | float],
+        labelvalues: tuple[str, ...],
+        engine_idx: int,
+    ) -> None:
+        prom_metric = self._get_prometheus_metric(metric_name, labelvalues, engine_idx)
+        for observation in value:
+            prom_metric.observe(observation)
+            if labelvalues or not self._observe_deprecated_metrics:
+                continue
+            # Keep deprecated CPU offload transfer metrics updated during the
+            # transition to flat metric names.
+            if metric_name == _TransferMetricName.LOAD_SIZE:
+                self.histogram_transfer_size[(engine_idx, _TransferType.LOAD)].observe(
+                    observation
+                )
+            elif metric_name == _TransferMetricName.STORE_SIZE:
+                self.histogram_transfer_size[(engine_idx, _TransferType.STORE)].observe(
+                    observation
+                )
+
+    def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
+        """Observe transfer statistics."""
+        metric_types = transfer_stats_data.get(_StatsKey.TYPES, {})
+        metric_data = transfer_stats_data.get(_StatsKey.DATA, {})
+        for key, label_value_map in metric_data.items():
+            type_str = metric_types.get(key)
+            if type_str is None:
+                raise AssertionError(f"Unknown offloading stats key: {key}")
+            assert key in self._offloading_metric_defs
+            for labelvalues, value in label_value_map.items():
+                if type_str == _MetricType.COUNTER:
+                    assert isinstance(value, int | float)
+                    self._increase_counter(key, value, labelvalues, engine_idx)
+                elif type_str == _MetricType.GAUGE:
+                    assert isinstance(value, int | float)
+                    self._set_gauge(key, value, labelvalues, engine_idx)
+                elif type_str == _MetricType.HISTOGRAM:
+                    assert isinstance(value, list)
+                    assert all(isinstance(v, int | float) for v in value)
+                    self._observe_histogram(key, value, labelvalues, engine_idx)
+                else:
+                    raise AssertionError(
+                        f"Unknown metric type '{type_str}' for key: {key}"
+                    )
+@@@ /usr/local/lib/python3.12/dist-packages/vllm/v1/kv_offload/tiering/base.py
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""
+Abstract interfaces and data types for the secondary tiering layer.
+"""
+
+from abc import ABC, abstractmethod
+from collections.abc import Collection, Iterable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, ClassVar
+
+import numpy as np
+
+from vllm.v1.kv_offload.base import (
+    Locality,
+    LookupResult,
+    Medium,
+    OffloadingEvent,
+    OffloadingMetricMetadata,
+    OffloadKey,
+    ReqContext,
+    RequestOffloadingContext,
+    ScheduleEndContext,
+)
+
+if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+        OffloadingConnectorStats,
+    )
+    from vllm.v1.kv_offload.base import OffloadingSpec
+
+
+# Type alias for job IDs used in async transfer tracking
+JobId = int
+
+
+class TieringOffloadingMetrics:
+    """Metric names for TieringOffloadingManager."""
+
+    LOOKUP_SYNC_DELAY = "vllm:kv_offload_tiering_lookup_sync_delay_seconds"
+    LOOKUP_ASYNC_DELAY = "vllm:kv_offload_tiering_lookup_async_delay_seconds"
+    READ_BYTES = "vllm:kv_offload_tiering_read_bytes"
+    READ_TIME = "vllm:kv_offload_tiering_read_time"
+    WRITE_BYTES = "vllm:kv_offload_tiering_write_bytes"
+    WRITE_TIME = "vllm:kv_offload_tiering_write_time"
+    PROMOTION_JOB_FAILURES = "vllm:kv_offload_tiering_promotion_job_failures"
+    CASCADE_JOB_FAILURES = "vllm:kv_offload_tiering_cascade_job_failures"
+    CHUNK_QUERIES = "vllm:kv_offload_tiering_chunk_queries"
+    CHUNK_HITS = "vllm:kv_offload_tiering_chunk_hits"
+    PRIMARY_WRITE_USAGE_PERC = "vllm:kv_offload_tiering_primary_write_usage_perc"
+    PRIMARY_READ_USAGE_PERC = "vllm:kv_offload_tiering_primary_read_usage_perc"
+    PROMOTION_ALLOCATION_FAILURES = (
+        "vllm:kv_offload_tiering_promotion_allocation_failures"
+    )
+    ACTIVE_PROMOTION_JOBS = "vllm:kv_offload_tiering_active_promotion_jobs"
+    ACTIVE_CASCADE_JOBS = "vllm:kv_offload_tiering_active_cascade_jobs"
+
+
+@dataclass
+class TransferJob:
+    """Metadata for an in-flight async transfer job."""
+
+    job_id: JobId
+    keys: Collection[OffloadKey]
+    chunk_ids: np.ndarray
+    is_promotion: bool
+    req_context: ReqContext
+
+
+@dataclass
+class JobResult:
+    """Result of an async transfer job."""
+
+    job_id: JobId
+    # True if all keys succeeded; False if all or some failed.
+    success: bool
+    # Only applicable to promotion jobs. On partial failure, identifies the
+    # keys that were successfully loaded. None means all keys share the fate
+    # indicated by `success`. Must be a subset of the job's original keys.
+    successful_keys: Collection[OffloadKey] | None = None
+    transfer_time: float | None = None
+
+
+class ParentManager(ABC):
+    """Interface for secondary tiers to call back into the tiering manager.
+
+    Passed to secondary tiers via serve_external_requests() each step.
+    The _SecondaryTierFacingParent wrapper implements this, automatically
+    excluding the calling tier from fan-out operations.
+
+    Required call sequence for each remote request:
+        1. on_new_request(req_context)  — set up per-request state
+        2. lookup(key, req_context)     — check chunk availability
+           (repeat per chunk)
+        3. create_store_job(keys, req_context) — pin chunks and get a
+           job handle
+        4. on_request_finished(req_context) — clean up per-request state
+
+    Steps 2-3 may be interleaved. Step 4 must be called even if no
+    chunks were found, to avoid leaking async lookup state (e.g. in
+    the fs tier's AsyncLookupManager).
+    """
+
+    @abstractmethod
+    def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext: ...
+
+    @abstractmethod
+    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult: ...
+
+    @abstractmethod
+    def create_store_job(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> TransferJob: ...
+
+    @abstractmethod
+    def on_request_finished(self, req_context: ReqContext) -> None: ...
+
+
+class SecondaryTierManager(ABC):
+    """
+    Abstract interface for managing a single non-primary offloading tier.
+
+    Secondary tiers cannot directly access GPU memory. All data transfers
+    must go through the CPU (primary) tier:
+      - Store: GPU → CPU (primary) → secondary  (cascade)
+      - Load:  secondary → CPU (primary) → GPU  (promotion)
+
+    IMPORTANT: All methods run in the Scheduler process and must be
+    lightweight and non-blocking. submit_load() and submit_store() submit
+    async jobs; get_finished_jobs() polls for completion.
+    """
+
+    medium: ClassVar[Medium | None] = None
+
+    def __init__(
+        self,
+        offloading_spec: "OffloadingSpec",
+        primary_kv_view: memoryview,
+        tier_type: str,
+    ) -> None:
+        """
+        Args:
+            offloading_spec: Offloading configuration.
+            primary_kv_view: Memoryview of the primary tier's CPU KV cache.
+            tier_type: Tier type identifier, set by SecondaryTierFactory
+                from the registered tier type.
+        """
+        self._offloading_spec = offloading_spec
+        self._primary_kv_view: memoryview = primary_kv_view
+        self.tier_type = tier_type
+        self.locality: Locality | None = None
+
+    @abstractmethod
+    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        """
+        Check whether a chunk exists in this secondary tier.
+
+        Args:
+            key: Offload key to look up.
+            req_context: per-request context (e.g. kv_transfer_params).
+
+        Returns:
+            HIT if the chunk is present and ready,
+            MISS if not found,
+            or RETRY if the chunk is being transferred (retry later).
+        """
+        pass
+
+    @abstractmethod
+    def submit_store(self, job_metadata: TransferJob) -> None:
+        """
+        Submit an async job to store chunks from the primary tier to this
+        secondary tier.
+
+        This method must be lightweight and non-blocking: allocate metadata
+        and submit the transfer, but do NOT perform the data copy on the
+        calling thread.
+
+        Preconditions (guaranteed by the framework):
+          - ``job_metadata.chunk_ids`` are valid primary-tier slots, pinned
+            (ref-counted) for the duration of the transfer.
+
+        The implementation is responsible for:
+          1. Filtering out chunks already present in this tier
+          2. Evicting chunks if capacity is needed
+          3. Allocating space in this tier
+          4. Submitting the async transfer (read from primary via chunk_ids)
+
+        Report completion via ``get_finished_jobs()``.
+
+        Args:
+            job_metadata: Job metadata including job_id, keys, and chunk_ids
+                          identifying the primary-tier slots to read from.
+        """
+        pass
+
+    @abstractmethod
+    def submit_load(self, job_metadata: TransferJob) -> None:
+        """
+        Submit an async job to load chunks from this secondary tier to the
+        primary tier.
+
+        This method must be lightweight and non-blocking: mark chunks as
+        in-flight and submit the transfer, but do NOT perform the data copy
+        on the calling thread.
+
+        Preconditions (guaranteed by the framework):
+          - ``job_metadata.chunk_ids`` are allocated primary-tier slots
+            ready to receive data.
+
+        The implementation must copy data from this tier into the
+        primary-tier slots identified by ``chunk_ids``.
+
+        Report completion via ``get_finished_jobs()``.
+
+        Args:
+            job_metadata: Job metadata including job_id, keys, and chunk_ids
+                          identifying the primary-tier slots to write into.
+        """
+        pass
+
+    @abstractmethod
+    def get_finished_jobs(self) -> Iterable[JobResult]:
+        """
+        Return all jobs (loads and stores) that completed since the last call.
+
+        The framework uses these results to release resources and finalize
+        transfers.
+
+        Returns:
+            Iterable of JobResult objects for jobs finished since the
+            last call.
+        """
+        pass
+
+    def has_pending_work(self) -> bool:
+        """Whether this tier needs the engine to keep stepping.
+
+        While True, on_schedule_end() and get_finished_jobs() continue
+        to be called even when no requests are scheduled.
+        """
+        return False
+
+    def take_events(self) -> Iterable[OffloadingEvent]:
+        """Take KV events for storage state owned by this tier."""
+        return ()
+
+    def touch(self, keys: Collection[OffloadKey], req_context: ReqContext):
+        """
+        Mark chunks as recently used for eviction policy.
+
+        Args:
+            keys: Offload keys to mark as recently used.
+            req_context: Per-request context.
+        """
+        return
+
+    @abstractmethod
+    def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
+        """
+        Called when a new request is first seen by the scheduler.
+
+        Returns a RequestOffloadingContext expressing this tier's preference
+        for how chunks should be offloaded for this request.
+
+        Args:
+            req_context: Per-request context.
+        """
+        pass
+
+    def on_request_finished(self, req_context: ReqContext) -> None:
+        """
+        Called when a request has finished.
+
+        By the time this is called, all per-request calls for this request
+        (submit_store, submit_load, touch) have already been issued, and none
+        will follow. Note this does NOT imply the tier's transfers have
+        completed: jobs already submitted may still be in flight and will
+        report via get_finished_jobs(). This is the right place to release
+        per-request bookkeeping.
+
+        Args:
+            req_context: per-request context.
+        """
+        return
+
+    def serve_external_requests(self, parent: ParentManager) -> None:
+        """Process remotely-originated requests using the parent manager.
+
+        Called once per scheduler step, BEFORE _flush_pending_promotions().
+        The parent handle is valid only for the duration of this call.
+        Tiers that don't serve external requests leave this as a no-op.
+        """
+        return
+
+    def on_schedule_end(self, context: ScheduleEndContext) -> None:
+        """Called once at the end of each scheduler step.
+
+        Args:
+            context: Per-step context from the scheduler.
+        """
+        return
+
+    @abstractmethod
+    def drain_jobs(self) -> None:
+        """Block until every submitted load/store job has completed or failed.
+
+        After this returns, no tier I/O is touching the primary memoryview,
+        and every submitted job's result is available from `get_finished_jobs()`
+        (yielded by a prior call or queued for the next one). Used by
+        `TieringOffloadingManager.reset_cache` to release primary slots
+        without racing with in-flight transfers.
+
+        Implementations must not abort a mid-flight transfer: a partial copy
+        would corrupt either the primary memoryview or the secondary backing
+        store. Queued (not-yet-started) transfers may be cancelled, but their
+        failure result must still appear in `get_finished_jobs()`.
+        """
+        pass
+
+    def shutdown(self) -> None:
+        """Release resources held by this tier (threads, connections, etc.)."""
+        return
+
+    @classmethod
+    def build_metric_definitions(
+        cls, extra_config: dict[str, Any]
+    ) -> dict[str, OffloadingMetricMetadata]:
+        """Return Prometheus metric definitions emitted by this tier."""
+        return {}
+
+    def get_stats(self) -> "OffloadingConnectorStats | None":
+        """Return and reset metric observations collected by this tier."""
+        return None
+@@@ /usr/local/lib/python3.12/dist-packages/vllm/v1/kv_offload/tiering/spec.py
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""
+TieringOffloadingSpec: Spec for multi-tier KV cache offloading.
+
+This spec creates a TieringOffloadingManager with a CPU primary tier
+and configurable secondary tiers (e.g., Storage, Network).
+
+Configuration via kv_connector_extra_config:
+  - cpu_bytes_to_use: (required) Bytes to allocate for CPU primary tier
+  - block_size: (optional) Tokens per offloaded chunk (default: GPU block size)
+  - eviction_policy: (optional) Primary tier eviction policy: built-in "lru"/
+    "arc", or the name of a policy registered via CachePolicyFactory, or an
+    out-of-tree CachePolicy class name paired with cache_policy_module_path
+    (default: "lru")
+  - cache_policy_module_path: (optional) Python import path to load
+    eviction_policy from when it names an out-of-tree CachePolicy not
+    registered via CachePolicyFactory
+  - secondary_tiers: (optional) List of secondary tier configurations
+    Each secondary tier config is a dict with:
+      - type: (required) Type of secondary tier (e.g., "example", "fs",
+        "p2p", "obj"), or the class name of an out-of-tree
+        SecondaryTierManager paired with module_path.
+      - module_path: (optional) Python import path to load 'type' from
+        when it names an out-of-tree SecondaryTierManager not registered
+        via SecondaryTierFactory.register_tier()
+      - Additional tier-specific parameters are passed directly to the tier
+        constructor. See each tier's documentation for supported parameters.
+
+Example configuration:
+{
+    "cpu_bytes_to_use": 10737418240,  # 10 GB
+    "block_size": 16,
+    "eviction_policy": "lru",
+    "secondary_tiers": [
+        {
+            "type": "example",
+            "custom_param": 67
+        }
+    ]
+}
+
+Example out-of-tree tier configuration:
+{
+    "cpu_bytes_to_use": 10737418240,
+    "secondary_tiers": [
+        {
+            "type": "MyCustomTier",
+            "module_path": "my_package.my_module",
+            "custom_param": "value"
+        }
+    ]
+}
+"""
+
+from typing import Any
+
+import torch
+from typing_extensions import override
+
+from vllm.logger import init_logger
+from vllm.v1.kv_offload.base import (
+    CanonicalKVCaches,
+    OffloadingCounterMetadata,
+    OffloadingGaugeMetadata,
+    OffloadingHistogramMetadata,
+    OffloadingManager,
+    OffloadingMetricMetadata,
+)
+from vllm.v1.kv_offload.config import OffloadingConfig
+from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
+from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+from vllm.v1.kv_offload.tiering.base import TieringOffloadingMetrics
+from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
+from vllm.v1.kv_offload.tiering.manager import (
+    CPUPrimaryTierOffloadingManager,
+    TieringOffloadingManager,
+)
+
+logger = init_logger(__name__)
+
+
+class TieringOffloadingSpec(CPUOffloadingSpec):
+    """
+    Spec for multi-tier KV cache offloading.
+
+    Creates a TieringOffloadingManager with:
+    - Primary tier: CPU (LRU or ARC eviction policy)
+    - Secondary tiers: Configurable via extra_config
+
+    The CPU primary tier has direct GPU access and serves as the gateway for
+    all GPU↔offload operations. Secondary tiers cannot directly access GPU
+    memory and must transfer data through the primary tier.
+    """
+
+    BLOCK_SIZE_ALIGNMENT = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
+
+    @classmethod
+    @override
+    def build_metric_definitions(
+        cls, extra_config: dict[str, Any]
+    ) -> dict[str, OffloadingMetricMetadata]:
+        metrics = super().build_metric_definitions(extra_config)
+        metrics[TieringOffloadingMetrics.LOOKUP_SYNC_DELAY] = (
+            OffloadingHistogramMetadata(
+                documentation=(
+                    "Histogram of blocking time spent in a per-chunk tier lookup "
+                    "that resolved as a hit or miss, labeled by tier, in seconds."
+                ),
+                labelnames=("tier",),
+                buckets=(
+                    0.00001,
+                    0.00005,
+                    0.0001,
+                    0.0005,
+                    0.001,
+                    0.005,
+                    0.01,
+                    0.05,
+                    0.1,
+                    0.5,
+                    1,
+                ),
+            )
+        )
+        metrics[TieringOffloadingMetrics.LOOKUP_ASYNC_DELAY] = (
+            OffloadingHistogramMetadata(
+                documentation=(
+                    "Histogram of wall-clock time from a per-chunk tier lookup "
+                    "first returning retry until that same tier lookup resolves "
+                    "as a hit or miss, labeled by tier, in seconds."
+                ),
+                labelnames=("tier",),
+                buckets=(
+                    0.0001,
+                    0.0005,
+                    0.001,
+                    0.005,
+                    0.01,
+                    0.05,
+                    0.1,
+                    0.5,
+                    1,
+                    5,
+                    10,
+                ),
+            )
+        )
+        metrics[TieringOffloadingMetrics.READ_BYTES] = OffloadingCounterMetadata(
+            documentation=(
+                "Total bytes read from secondary tiers into the primary tier, "
+                "labeled by tier."
+            ),
+            labelnames=("tier",),
+        )
+        metrics[TieringOffloadingMetrics.READ_TIME] = OffloadingCounterMetadata(
+            documentation=(
+                "Total time spent reading from secondary tiers into the primary "
+                "tier, in seconds, labeled by tier."
+            ),
+            labelnames=("tier",),
+        )
+        metrics[TieringOffloadingMetrics.WRITE_BYTES] = OffloadingCounterMetadata(
+            documentation=(
+                "Total bytes written from the primary tier to secondary tiers, "
+                "labeled by tier."
+            ),
+            labelnames=("tier",),
+        )
+        metrics[TieringOffloadingMetrics.WRITE_TIME] = OffloadingCounterMetadata(
+            documentation=(
+                "Total time spent writing from the primary tier to secondary "
+                "tiers, in seconds, labeled by tier."
+            ),
+            labelnames=("tier",),
+        )
+        metrics[TieringOffloadingMetrics.PROMOTION_JOB_FAILURES] = (
+            OffloadingCounterMetadata(
+                documentation=(
+                    "Number of failed secondary-tier promotion jobs, labeled by tier."
+                ),
+                labelnames=("tier",),
+            )
+        )
+        metrics[TieringOffloadingMetrics.CASCADE_JOB_FAILURES] = (
+            OffloadingCounterMetadata(
+                documentation=(
+                    "Number of failed secondary-tier cascade jobs, labeled by tier."
+                ),
+                labelnames=("tier",),
+            )
+        )
+        metrics[TieringOffloadingMetrics.CHUNK_QUERIES] = OffloadingCounterMetadata(
+            documentation=(
+                "Number of chunk lookup queries sent to a tier, labeled by tier."
+            ),
+            labelnames=("tier",),
+        )
+        metrics[TieringOffloadingMetrics.CHUNK_HITS] = OffloadingCounterMetadata(
+            documentation="Number of chunk lookup hits in a tier, labeled by tier.",
+            labelnames=("tier",),
+        )
+        metrics[TieringOffloadingMetrics.PROMOTION_ALLOCATION_FAILURES] = (
+            OffloadingCounterMetadata(
+                documentation=(
+                    "Number of promotion attempts that failed because the "
+                    "primary tier could not allocate space."
+                ),
+            )
+        )
+        metrics[TieringOffloadingMetrics.PRIMARY_WRITE_USAGE_PERC] = (
+            OffloadingGaugeMetadata(
+                documentation=(
+                    "Current fraction of primary-tier space used by writes from "
+                    "secondary tiers, labeled by tier."
+                ),
+                labelnames=("tier",),
+            )
+        )
+        metrics[TieringOffloadingMetrics.PRIMARY_READ_USAGE_PERC] = (
+            OffloadingGaugeMetadata(
+                documentation=(
+                    "Current fraction of primary-tier space used by reads to "
+                    "secondary tiers, labeled by tier."
+                ),
+                labelnames=("tier",),
+            )
+        )
+        metrics[TieringOffloadingMetrics.ACTIVE_PROMOTION_JOBS] = (
+            OffloadingGaugeMetadata(
+                documentation=(
+                    "Number of active secondary-tier promotion jobs, labeled by tier."
+                ),
+                labelnames=("tier",),
+            )
+        )
+        metrics[TieringOffloadingMetrics.ACTIVE_CASCADE_JOBS] = OffloadingGaugeMetadata(
+            documentation=(
+                "Number of active secondary-tier cascade jobs, labeled by tier."
+            ),
+            labelnames=("tier",),
+        )
+        secondary_tier_configs = extra_config.get("secondary_tiers", [])
+        if not isinstance(secondary_tier_configs, list):
+            raise ValueError("secondary_tiers must be a list of tier configurations")
+
+        for tier_config in secondary_tier_configs:
+            assert isinstance(tier_config, dict)
+            tier_cls = SecondaryTierFactory.get_tier_class(tier_config)
+            metrics.update(tier_cls.build_metric_definitions(tier_config))
+        return metrics
+
+    def __init__(self, config: OffloadingConfig):
+        super().__init__(config)
+        # Redeclare for mypy: parent sets this but `--follow-imports skip` hides it
+        self._manager: OffloadingManager | None = None
+
+        # Parse secondary tier configurations
+        self.secondary_tier_configs = self.extra_config.get("secondary_tiers", [])
+        if not isinstance(self.secondary_tier_configs, list):
+            raise ValueError("secondary_tiers must be a list of tier configurations")
+
+        # Scheduler-side mmap (rank=None); kept for cleanup
+        self._scheduler_mmap: SharedOffloadRegion | None = None
+
+        # Set by create_worker when canonical_layout is enabled: True when
+        # every layer's canonical bytes are parallelism-agnostic (portable),
+        # False when some layers use the opaque fallback (exact-topology only)
+        self.all_layers_portable: bool | None = None
+
+        # engine_id is unique per DP replica (suffixed with _dp{rank} in both
+        # the Ray and multiprocessing paths), so it names a per-replica offload
+        # region.
+        self._engine_id = config.engine_id
+
+    @override
+    def get_manager(self) -> OffloadingManager:
+        """
+        Get the TieringOffloadingManager.
+
+        Creates a TieringOffloadingManager with:
+        - Primary tier: CPU (LRU or ARC)
+        - Secondary tiers: As configured in extra_config
+
+        Returns:
+            TieringOffloadingManager instance
+        """
+        if not self._manager:
+            if int(self.extra_config.get("store_threshold", 0)) >= 2:
+                raise ValueError(
+                    "store_threshold is not supported for TieringOffloadingSpec"
+                )
+
+            scheduler_mmap: SharedOffloadRegion | None = None
+            primary_tier: CPUPrimaryTierOffloadingManager | None = None
+            secondary_tiers = []
+            try:
+                # Create scheduler-side SharedOffloadRegion (rank=None) so the
+                # primary tier can eagerly create a memoryview over _base.
+                scheduler_mmap = SharedOffloadRegion(
+                    engine_id=self._engine_id,
+                    num_chunks=self.num_chunks,
+                    rank=None,
+                    kv_bytes_per_chunk=self.kv_bytes_per_chunk,
+                    cpu_page_size=self.cpu_page_size_per_worker,
+                )
+                self._scheduler_mmap = scheduler_mmap
+
+                # Create primary tier (CPU-based)
+                primary_tier = CPUPrimaryTierOffloadingManager(
+                    num_chunks=self.num_chunks,
+                    cache_policy=self.eviction_policy,
+                    cache_policy_module_path=self.cache_policy_module_path,
+                    enable_events=self.kv_events_config.enable_kv_cache_events,
+                    mmap_region=scheduler_mmap,
+                )
+
+                # Create secondary tiers
+                primary_kv_view = primary_tier.get_kv_memoryview()
+                for i, tier_config in enumerate(self.secondary_tier_configs):
+                    tier = SecondaryTierFactory.create_secondary_tier(
+                        tier_config, primary_kv_view, self
+                    )
+                    secondary_tiers.append(tier)
+                    logger.info(
+                        "Created secondary tier #%d (%s)",
+                        i,
+                        tier.tier_type,
+                    )
+
+                # Create TieringOffloadingManager. GPU↔CPU transfers use the inherited
+                # get_worker(). Secondary tier transfers are handled by the
+                # secondary tier managers and need no additional workers here.
+                tiering_manager = TieringOffloadingManager(
+                    primary_tier=primary_tier,
+                    secondary_tiers=secondary_tiers,
+                )
+                self._manager = tiering_manager
+            except Exception:
+                for tier in reversed(secondary_tiers):
+                    try:
+                        tier.shutdown()
+                    except Exception:
+                        logger.exception(
+                            "Failed to shut down secondary tier during "
+                            "initialization cleanup"
+                        )
+                if primary_tier is not None:
+                    try:
+                        primary_tier.shutdown()
+                    except Exception:
+                        logger.exception(
+                            "Failed to shut down primary tier during "
+                            "initialization cleanup"
+                        )
+                elif scheduler_mmap is not None:
+                    try:
+                        scheduler_mmap.cleanup()
+                    except Exception:
+                        logger.exception(
+                            "Failed to clean up scheduler mmap during "
+                            "initialization cleanup"
+                        )
+                self._scheduler_mmap = None
+                raise
+
+            logger.info(
+                "Created TieringOffloadingManager with primary tier "
+                "(%s, %s chunks) and %s secondary tier(s)",
+                self.eviction_policy,
+                self.num_chunks,
+                len(secondary_tiers),
+            )
+
+        return self._manager
+
+    @override
+    def _uses_shared_region(self) -> bool:
+        # Tiering always allocates on the shared region (every platform), so the
+        # replicated-layout gate must not be narrowed by the CPU spec's
+        # CUDA-alike check.
+        return True
+
+    @override
+    def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
+        world_size = self.config.parallel.world_size
+        if self.replicated_layout:
+            rank = 0
+        else:
+            # Fold the global physical device index into the replica-local
+            # [0, world_size) slot range.
+            rank = torch.accelerator.current_device_index() % world_size
+        worker_mmap = SharedOffloadRegion(
+            engine_id=self._engine_id,
+            num_chunks=self.num_chunks,
+            rank=rank,
+            kv_bytes_per_chunk=self.kv_bytes_per_chunk,
+            cpu_page_size=self.cpu_page_size_per_worker,
+        )
+        try:
+            if self.config.canonical_layout:
+                self._validate_canonical_refs(kv_caches)
+            return CPUOffloadingWorker(
+                kv_caches=kv_caches,
+                blocks_per_chunk=self.blocks_per_chunk,
+                num_cpu_chunks=self.num_chunks,
+                mmap_region=worker_mmap,
+                canonical_layout=self.config.canonical_layout,
+            )
+        except Exception:
+            worker_mmap.cleanup()
+            raise
+
+    def _validate_canonical_refs(self, kv_caches: CanonicalKVCaches) -> None:
+        """Require a mapping on every ref and record layer portability.
+
+        Fails loudly rather than persist direct-layout bytes under a
+        canonical format identity."""
+        all_refs = [
+            ref for group_refs in kv_caches.group_data_refs for ref in group_refs
+        ]
+        if any(ref.mapping is None for ref in all_refs):
+            raise RuntimeError(
+                "canonical_layout was requested but the KV cache layout "
+                "could not be certified for canonical offload (offload "
+                "workers must be exactly the TP group, and packed / "
+                "cross-layer KV layouts are not supported). Remove "
+                "canonical_layout from kv_connector_extra_config."
+            )
+        self.all_layers_portable = all(
+            ref.mapping is not None and ref.mapping.parallelism_agnostic
+            for ref in all_refs
+        )
+        if self.config.parallel.is_parallelism_agnostic and not (
+            self.all_layers_portable
+        ):
+            # The scheduler-side storage namespace was already collapsed on
+            # the static portability claim; opaque per-topology bytes must
+            # not land in it.
+            raise RuntimeError(
+                "canonical_layout could not certify every layer as "
+                "parallelism-agnostic, but the storage namespace is shared "
+                "across topologies. Remove canonical_layout from "
+                "kv_connector_extra_config or disable parallel-agnostic "
+                "secondary tiers."
+            )
+        logger.info(
+            "Canonical KV layout enabled (all_layers_portable=%s)",
+            self.all_layers_portable,
+        )
+@@@ /usr/local/lib/python3.12/dist-packages/vllm/v1/kv_offload/base.py
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""
+Core abstractions for KV cache offloading in vLLM v1.
+"""
+
+from abc import ABC, abstractmethod
+from collections.abc import Collection, Iterable, Sequence
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, NewType, TypeVar
+
+import numpy as np
+import torch
+
+if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+        OffloadingConnectorStats,
+    )
+
+from vllm.v1.kv_offload.config import OffloadingConfig
+
+# `OffloadKey` identifies an offloaded block. It combines a block hash with
+# its KV cache group index, encoded as raw bytes to avoid tuple GC overhead.
+# Use the helper functions below to construct / decompose keys.
+OffloadKey = NewType("OffloadKey", bytes)
+
+
+def make_offload_key(block_hash: bytes, group_idx: int) -> OffloadKey:
+    """Pack a block hash and group index into an `OffloadKey`."""
+    return OffloadKey(block_hash + group_idx.to_bytes(4, "big", signed=False))
+
+
+def get_offload_block_hash(key: OffloadKey) -> bytes:
+    """Extract the block hash from an `OffloadKey`."""
+    return key[:-4]
+
+
+def get_offload_group_idx(key: OffloadKey) -> int:
+    """Extract the group index from an `OffloadKey`."""
+    return int.from_bytes(key[-4:], "big", signed=False)
+
+
+_T = TypeVar("_T")
+
+
+class Medium(Enum):
+    """Storage medium of an offloading tier."""
+
+    CPU = "CPU"
+    STORAGE = "STORAGE"
+
+
+class Locality(Enum):
+    """Locality of a tier's storage relative to the publishing instance."""
+
+    LOCAL = "LOCAL"
+    REMOTE = "REMOTE"
+
+
+class TierMatcher(NamedTuple):
+    medium: Medium | None = None
+    locality: Locality | None = None
+
+    def matches(self, medium: Medium | None, locality: Locality | None) -> bool:
+        medium_matches = self.medium is None or medium is None or self.medium == medium
+        locality_matches = (
+            self.locality is None or locality is None or self.locality == locality
+        )
+        return medium_matches and locality_matches
+
+
+@dataclass(frozen=True)
+class TierFilter:
+    """Per-request filter controlling which tiers participate."""
+
+    matchers: tuple[TierMatcher, ...] = ()
+
+    ALL: ClassVar["TierFilter"]
+
+    def allows(self, medium: Medium | None, locality: Locality | None) -> bool:
+        if self is TierFilter.ALL:
+            return True
+        return any(m.matches(medium, locality) for m in self.matchers)
+
+
+TierFilter.ALL = TierFilter(matchers=(TierMatcher(),))
+
+
+@dataclass
+class ReqContext:
+    req_id: str
+    kv_transfer_params: dict[str, Any] | None = None
+    load_tier_filter: TierFilter = TierFilter.ALL
+    # Per-request scratch space keyed by value type, so a tier can parse
+    # kv_transfer_params once (in on_new_request) and read the result back
+    # on later calls for the same request.
+    _state: dict[type, Any] = field(default_factory=dict, repr=False, init=False)
+
+    def set_state(self, val: Any) -> None:
+        self._state[type(val)] = val
+
+    def get_state(self, cls: type[_T]) -> _T | None:
+        return self._state.get(cls)
+
+
+class LookupResult(Enum):
+    """Result of OffloadingManager.lookup()."""
+
+    MISS = auto()
+    HIT = auto()
+    HIT_PENDING = auto()
+    RETRY = auto()
+
+
+class OffloadPolicy(Enum):
+    # Offload only newly-computed chunks as they arrive; prefix-hit
+    # chunks (already offloaded by a prior request) are skipped.
+    CHUNK_LEVEL = "chunk_level"
+    # Offload all chunks for the request, including prefix hits.
+    # Used by tiers that need the complete KV context for a request.
+    REQUEST_LEVEL = "request_level"
+
+
+@dataclass
+class RequestOffloadingContext:
+    policy: OffloadPolicy = OffloadPolicy.CHUNK_LEVEL
+
+
+class ScheduleEndContext(NamedTuple):
+    """Per-step scheduling info passed to on_schedule_end()."""
+
+    # Request IDs scheduled for the first time this step.
+    new_req_ids: Collection[str]
+    # Request IDs preempted this step.
+    preempted_req_ids: Collection[str]
+
+
+class LoadStoreSpec:
+    """
+    Metadata that encapsulates information allowing a worker
+    to load, and optionally also to store, blocks of KV data.
+    """
+
+
+@dataclass
+class PrepareStoreOutput:
+    keys_to_store: list[OffloadKey]
+    store_spec: LoadStoreSpec
+    evicted_keys: list[OffloadKey]
+    # Explicit policy skips, not capacity declines. Omitted keys otherwise
+    # remain retryable. Already-durable keys may also be acknowledged here;
+    # pending writes must not be acknowledged (they can still fail).
+    skipped_keys: Collection[OffloadKey] = ()
+
+
+@dataclass
+class OffloadingEvent:
+    keys: list[OffloadKey]
+    medium: Medium
+    # True if blocks are removed, False if stored
+    removed: bool
+    locality: Locality | None = None
+    # Secondary tier identifier that generated the event, or None for primary.
+    ownership: str | None = None
+    removal_expected: bool = False
+
+
+"""
+OffloadingManager class for managing KV data offloading in vLLM v1
+
+This class runs in the scheduler, tracks which blocks are offloaded
+and their address.
+
+The class provides the following primitives:
+    lookup() - check whether a single block is offloaded and ready.
+    prepare_load() - prepare given blocks to be read.
+        The given blocks will be protected from eviction.
+        This function returns a LoadSpec which encapsulates
+        information required for performing the load.
+    touch() - marks the give blocks as recently used. Can be used
+        to track block's LRU. This function is separated from the
+        prepare_load function to allow setting block recency even
+        for blocks which do not need reading from the cache, such as
+        blocks that are cached by the GPU prefix cache.
+    complete_load() - mark blocks which were previously prepared to be
+        loaded as done loading. This is to re-allow their eviction.
+    prepare_store() - prepare the given blocks to be written.
+        Returns a StoreSpec encapsulating offloading information,
+        as well as a list of blocks that were evicted as a result.
+    complete_store() - marks a previous store as completed.
+        Following this call, the given blocks will become loadable.
+"""
+
+
+@dataclass(frozen=True)
+class OffloadingMetricMetadata:
+    documentation: str
+    labelnames: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class OffloadingCounterMetadata(OffloadingMetricMetadata):
+    pass
+
+
+@dataclass(frozen=True)
+class OffloadingGaugeMetadata(OffloadingMetricMetadata):
+    pass
+
+
+@dataclass(frozen=True)
+class OffloadingHistogramMetadata(OffloadingMetricMetadata):
+    buckets: tuple[float, ...] | None = None
+
+
+@dataclass(frozen=True)
+class OffloadingKVEventsConfig:
+    # Global vLLM KV event publishing flag. When false, connector-specific
+    # event capture must stay inert because take_events() is not drained.
+    enable_kv_cache_events: bool
+    # OffloadingConnector opt-in for self-describing BlockStored payloads.
+    # Effective only when enable_kv_cache_events is true.
+    self_describing_kv_events: bool
+
+
+class OffloadingManager(ABC):
+    @abstractmethod
+    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        """
+        Checks whether a single block is offloaded and ready to be read.
+
+        Args:
+            key: the key identifying the block to lookup.
+            req_context: per-request context (e.g. kv_transfer_params).
+
+        Returns:
+            HIT if the block is offloaded and ready, MISS if not found,
+            HIT_PENDING if found but not yet readable, or RETRY if the
+            lookup should be retried later.
+        """
+        pass
+
+    @abstractmethod
+    def prepare_load(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> LoadStoreSpec:
+        """
+        Prepare the given blocks to be read.
+        The given blocks will be protected from eviction until
+        complete_load is called.
+        It assumes all given blocks are offloaded.
+
+        Args:
+            keys: the keys identifying the blocks.
+            req_context: per-request context (e.g. kv_transfer_params).
+
+        Returns:
+            A LoadStoreSpec that can be used by a worker to locate and load
+            the actual offloaded KV data.
+        """
+        pass
+
+    def touch(self, keys: Collection[OffloadKey], req_context: ReqContext):
+        """
+        Mark the given blocks as recently used.
+        This could in practice mean moving them to the end of an LRU list.
+
+        Args:
+            keys: the keys identifying the blocks.
+            req_context: per-request context (e.g. kv_transfer_params).
+        """
+        return
+
+    def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
+        """
+        Marks previous blocks that were prepared to load as done loading.
+
+        Args:
+            keys: the keys identifying the blocks.
+            req_context: per-request context (e.g. kv_transfer_params).
+        """
+        return
+
+    def can_store(self) -> bool:
+        """Whether retrying store admission can still make progress.
+
+        Return False only for terminal/disabled storage, not temporary pressure.
+        This abandons unsaved finished-request frontiers without acknowledging
+        them, and never releases active transfers before their all-rank drain.
+        """
+        return True
+
+    @abstractmethod
+    def prepare_store(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> PrepareStoreOutput | None:
+        """
+        Prepare the given blocks to be offloaded.
+        The given blocks will be protected from eviction until
+        complete_store is called.
+
+        Args:
+            keys: the keys identifying the blocks.
+            req_context: per-request context (e.g. kv_transfer_params).
+
+        Returns:
+            A PrepareStoreOutput indicating which blocks need storing,
+            where to store them (LoadStoreSpec), and list of blocks that
+            were evicted as a result.
+            None is returned if the blocks cannot be stored.
+        """
+        pass
+
+    def complete_store(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+        success: bool = True,
+    ):
+        """
+        Marks blocks which were previously prepared to be stored, as stored.
+        Following this call, the blocks become loadable.
+        If success is False, blocks that were not marked as stored will be
+        removed.
+
+        Args:
+            keys: the keys identifying the blocks.
+            req_context: per-request context (e.g. kv_transfer_params).
+            success: whether the blocks were stored successfully.
+        """
+        return
+
+    @abstractmethod
+    def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
+        """
+        Called when a new request is first seen by the scheduler.
+
+        Returns a RequestOffloadingContext indicating how this request's
+        blocks should be offloaded.
+
+        Args:
+            req_context: per-request context.
+        """
+        pass
+
+    def on_request_finished(self, req_context: ReqContext) -> None:
+        """
+        Called when a request has finished.
+
+        By the time this is called, the scheduler will issue no more
+        submit-side calls for this request, such as prepare_store() and
+        prepare_load(). Completion callbacks for already-submitted transfers
+        (complete_store() and complete_load()) may still arrive afterward.
+
+        This hook does NOT imply the data has been persisted. Asynchronous
+        transfers already submitted for this request may still be in flight.
+        Managers that cascade to lower tiers should delay those tiers'
+        on_request_finished() calls until no more lower-tier submit calls can
+        be issued for this request.
+
+        Args:
+            req_context: per-request context.
+        """
+        return
+
+    def on_load_failure(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        """Invalidate failed objects after all ranks drain and complete_load.
+
+        Persistent managers must quarantine these keys across participants.
+        The connector also disables external lookup for the affected request,
+        so legacy managers cannot trap it in a failed-load retry loop.
+        """
+        return
+
+    def take_events(self) -> Iterable[OffloadingEvent]:
+        """
+        Take the offloading events from the manager.
+
+        A tier manager emits only events for storage state it owns. A
+        composing manager may aggregate child event streams, but should not
+        synthesize events on behalf of a child tier.
+
+        Yields:
+            New OffloadingEvents collected since the last call.
+        """
+        return ()
+
+    def on_schedule_end(self, context: ScheduleEndContext) -> None:
+        """Called once at the end of each scheduler step.
+
+        Managers may override this to flush deferred work accumulated
+        during the step (e.g., batched promotions).
+        """
+        return
+
+    def has_pending_work(self) -> bool:
+        """Whether this manager needs the engine to keep stepping.
+
+        While True, on_schedule_end() and get_finished_jobs() continue
+        to be called even when no requests are scheduled.
+        """
+        return False
+
+    def reset_cache(self) -> None:
+        """Evict all tracked blocks and reset internal state."""
+        return
+
+    def get_stats(self) -> "OffloadingConnectorStats | None":
+        """Return collected metrics since last call, or None if disabled."""
+        return None
+
+    def shutdown(self) -> None:
+        """Shutdown the manager and release any resources."""
+        return
+
+
+class BlockIDsLoadStoreSpec(LoadStoreSpec, ABC):
+    """
+    Spec for loading/storing KV blocks from given block numbers.
+
+    Subclass semantics differ: GPULoadStoreSpec.block_ids are GPU block
+    indices; CPULoadStoreSpec.block_ids are CPU cache chunk indices.
+    """
+
+    def __init__(self, block_ids: list[int]):
+        self.block_ids = np.array(block_ids, dtype=np.int32)
+
+    def __repr__(self) -> str:
+        return repr(self.block_ids)
+
+
+class GPULoadStoreSpec(BlockIDsLoadStoreSpec):
+    """
+    Spec for loading/storing a KV block to GPU memory.
+
+    If there are multiple KV groups, the blocks are expected to be
+    ordered by the group index.
+    In that case, group_sizes[i] determines the number of blocks
+    per the i-th KV group, and thus sum(group_sizes) == len(block_ids).
+    group_sizes=None indicates a single KV group.
+
+    If block_indices is given, each group (determined by group_sizes) of block IDs
+    will correspond to logically contiguous blocks, e.g. blocks 5-10 of a some request.
+    block_indices[i] will represent the block index of the first block in group #i.
+    Thus, len(block_indices) == len(group_sizes) = number of KV cache groups.
+    This information is required in order to support off/loading from offloaded blocks
+    which are larger than GPU blocks.
+    In such cases, the first GPU block per each group may be unaligned to the offloaded
+    block size, and so knowing block_indices[i] allows the worker to correctly
+    skip part of the first matching offloaded block.
+    """
+
+    def __init__(
+        self,
+        block_ids: list[int],
+        group_sizes: Sequence[int],
+        block_indices: Sequence[int],
+    ):
+        super().__init__(block_ids)
+        assert sum(group_sizes) == len(block_ids)
+        assert len(block_indices) == len(group_sizes)
+        self.group_sizes: Sequence[int] = group_sizes
+        self.block_indices: Sequence[int] = block_indices
+
+
+@dataclass
+class CanonicalKVCacheTensor:
+    """
+    A canonicalized KV cache tensor whose first dimension is num_blocks.
+
+    With standardized layouts (RFC #42082) num_blocks is always the leading
+    logical dimension.
+    """
+
+    # The KV cache tensor with shape (num_blocks, ...)
+    tensor: torch.Tensor
+    # The (possibly padded) page size per block in bytes
+    page_size_bytes: int
+
+
+@dataclass(frozen=True)
+class CopyRun:
+    """A strided byte correspondence between this worker's physical page and
+    a canonical page: for i in range(num_fragments), fragment i spans
+    [local_offset + i * local_stride, +fragment_size) in the worker's page and
+    [canonical_offset + i * canonical_stride, +fragment_size) canonically."""
+
+    local_offset: int
+    canonical_offset: int
+    fragment_size: int
+    num_fragments: int
+    local_stride: int
+    canonical_stride: int
+
+
+@dataclass(frozen=True)
+class CanonicalPageMapping:
+    """How this worker's page maps into a canonical (parallelism-free) page.
+    In-process only, never serialized. Runs cover the full local page in both
+    directions; ranks holding identical bytes take turns writing them.
+    """
+
+    # Size of the canonical page in bytes
+    canonical_page_size_bytes: int
+    # Size of this worker's (un-padded) page in bytes
+    local_page_size_bytes: int
+    # Byte correspondences between this worker's page and a canonical page
+    runs: tuple[CopyRun, ...]
+    # Number of ranks holding these exact bytes
+    num_writers: int
+    # This worker's index among those ranks
+    writer_index: int
+    # Canonical bytes identical under any parallel config with this block span
+    parallelism_agnostic: bool
+
+    def is_writer(self, block_id: int) -> bool:
+        """Whether this worker stores the canonical page of the given block.
+        Rotating by block spreads writes across ranks holding identical bytes.
+        """
+        return block_id % self.num_writers == self.writer_index
+
+
+@dataclass
+class CanonicalKVCacheRef:
+    """
+    Per-layer (or group of layers) reference to a specific (by index)
+    CanonicalKVCacheTensor and records the un-padded page size used by that layer.
+    """
+
+    # Index into the list of CanonicalKVCacheTensor objects
+    tensor_idx: int
+    # The un-padded page size per block in bytes
+    page_size_bytes: int
+    # How this worker's page maps into a canonical page; None = uncertified
+    mapping: CanonicalPageMapping | None = None
+
+
+@dataclass
+class CanonicalKVCaches:
+    """
+    Canonicalized block-level representation of the KV caches.
+
+    Composed of:
+        - Unique list of KV cache data tensors,
+          each with shape (num_blocks, page_size_in_bytes) and int8 dtype.
+        - Per-group data references of the tensors.
+          i.e. how each KV cache group maps to the tensors.
+    """
+
+    # Ordered list of unique block tensors, each with shape
+    # (num_blocks, ...).
+    tensors: list[CanonicalKVCacheTensor]
+    # Per-KV-cache-group list of data references that map each layer
+    # in the group to the appropriate entry in the tensors list.
+    group_data_refs: list[list[CanonicalKVCacheRef]]
+
+
+@dataclass
+class TransferResult:
+    job_id: int
+    success: bool
+    transfer_size: int | None = None
+    transfer_time: float | None = None
+
+
+class OffloadingWorker(ABC):
+    """Runs in the worker process. Performs async KV transfers for ONE
+    offloaded medium (e.g. CPU). Direction is explicit via submit_store /
+    submit_load, so there is no (src_medium, dst_medium) routing."""
+
+    @abstractmethod
+    def submit_store(
+        self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
+    ) -> bool:
+        """Async GPU -> offloaded medium.
+
+        Returns:
+            True if transfer was submitted successfully. On False or an
+            exception, wait({job_id}) must still drain any partially issued
+            work. Register ownership before issuing copies or I/O.
+        """
+
+    @abstractmethod
+    def submit_load(
+        self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec
+    ) -> bool:
+        """Async offloaded medium -> GPU.
+
+        Returns:
+            True if transfer was submitted successfully. On False or an
+            exception, wait({job_id}) must still drain any partially issued
+            work. Register ownership before issuing copies or I/O.
+        """
+
+    @abstractmethod
+    def get_finished(self) -> list[TransferResult]:
+        """
+        Get transfers finished since last call. Every result, including a
+        failure, certifies no further access to source/destination buffers.
+        Persistent stores report success only after durable publication.
+
+        Returns:
+            A list of TransferResults.
+        """
+
+    @abstractmethod
+    def wait(self, job_ids: set[int]) -> None:
+        """
+        Wait for all GPU, CPU and media work for these jobs to finish.
+        Unknown/unsubmitted IDs are harmless. Returning certifies no later
+        buffer access; inability to drain must raise, never return early.
+
+        Args:
+            job_ids: The set of job IDs to wait for.
+        """
+
+    def shutdown(self) -> None:
+        return
+
+
+class OffloadingSpec(ABC):
+    """Spec for an offloading connector"""
+
+    @classmethod
+    def build_metric_definitions(
+        cls, extra_config: dict[str, Any]
+    ) -> dict[str, "OffloadingMetricMetadata"]:
+        """Return Prometheus metric definitions emitted by this spec."""
+        return {}
+
+    def __init__(self, config: OffloadingConfig):
+        self.config = config
+        self.extra_config = config.extra_config
+        self.replicated_layout: bool = False
+        self.kv_events_config = OffloadingKVEventsConfig(
+            enable_kv_cache_events=config.enable_kv_cache_events,
+            self_describing_kv_events=bool(
+                self.extra_config.get("self_describing_kv_events", False)
+            ),
+        )
+
+        # When True, only prompt (prefill) blocks are offloaded; decode-phase
+        # blocks (KV generated after the prompt) are skipped. Useful when prior
+        # turns' generated tokens are dropped before the next turn (e.g.
+        # reasoning models that strip thinking).
+        self.offload_prompt_only: bool = bool(
+            self.extra_config.get("offload_prompt_only", True)
+        )
+
+        self.tokens_per_block = tuple(group.tokens_per_block for group in config.groups)
+        self.tokens_per_hash = config.cache.tokens_per_hash
+        self.blocks_per_chunk = config.cache.blocks_per_chunk
+
+    @abstractmethod
+    def get_manager(self) -> OffloadingManager:
+        """
+        Get an OffloadingManager that will be used
+        by the scheduler-side offloading connector to track
+        offloaded blocks and manage evictions.
+        """
+        pass
+
+    @abstractmethod
+    def get_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
+        """
+        Get an OffloadingWorker that handles async KV transfers for this spec.
+
+        Args:
+            kv_caches: Canonicalized KV caches.
+
+        Returns:
+            An OffloadingWorker instance for this medium.
+        """
+        pass

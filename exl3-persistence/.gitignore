@@ -1,0 +1,18 @@
+# Local settings, secrets, model files and generated evidence stay local.
+.env
+*.env
+*.key
+*.pem
+*credentials*
+__pycache__/
+*.py[cod]
+.venv/
+models/
+weights/
+results/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.log
+*.tar.gz

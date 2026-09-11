@@ -1,0 +1,114 @@
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -2309,6 +2309,25 @@
+ ) -> None:
+     """Store and log the resolved KV cache capacity."""
+     num_tokens, max_concurrency = get_kv_cache_capacity(vllm_config, kv_cache_config)
++    # STARTUP_OBSERVER_BEGIN engine_final
++    if __import__("os").environ.get("VLLM_STARTUP_OBSERVER") == "1":
++        try:
++            from startup_observer import emit as _startup_observer_emit
++            _startup_observer_emit("engine_final",
++                vllm_config=vllm_config,
++                kv_cache_config=kv_cache_config,
++                num_tokens=num_tokens,
++                max_concurrency=max_concurrency,
++            )
++        except Exception as _startup_observer_error:
++            try:
++                __import__("sys").stderr.write(
++                    "[STARTUP_OBSERVER_INCOMPLETE] stage=engine_final import_or_call_error="
++                    + type(_startup_observer_error).__name__ + "\n"
++                )
++            except Exception:
++                pass
++    # STARTUP_OBSERVER_END engine_final
+     vllm_config.cache_config.kv_cache_size_tokens = num_tokens
+     vllm_config.cache_config.kv_cache_max_concurrency = max_concurrency
+     max_model_len = vllm_config.model_config.max_model_len
+@@ -2597,6 +2616,25 @@
+         _project_kv_cache_groups_to_worker(global_kv_cache_groups, worker_spec)
+         for worker_spec in kv_cache_specs
+     ]
++    # STARTUP_OBSERVER_BEGIN engine_projection
++    if __import__("os").environ.get("VLLM_STARTUP_OBSERVER") == "1":
++        try:
++            from startup_observer import emit as _startup_observer_emit
++            _startup_observer_emit("engine_projection",
++                vllm_config=vllm_config,
++                kv_cache_specs=kv_cache_specs,
++                projected_groups=projected_groups_per_worker,
++                available_memory=available_memory,
++            )
++        except Exception as _startup_observer_error:
++            try:
++                __import__("sys").stderr.write(
++                    "[STARTUP_OBSERVER_INCOMPLETE] stage=engine_projection import_or_call_error="
++                    + type(_startup_observer_error).__name__ + "\n"
++                )
++            except Exception:
++                pass
++    # STARTUP_OBSERVER_END engine_projection
+ 
+     # If `num_gpu_blocks_override` is set, the cache size that will actually
+     # be allocated is decoupled from the profiled `available_memory`:
+--- a/vllm/v1/worker/gpu/attn_utils.py
++++ b/vllm/v1/worker/gpu/attn_utils.py
+@@ -218,6 +218,27 @@
+     kv_cache_allocation_context: AbstractContextManager | None = None,
+ ) -> dict[str, Any]:
+     allocation_context = kv_cache_allocation_context or nullcontext()
++    # STARTUP_OBSERVER_BEGIN worker_preallocation
++    if __import__("os").environ.get("VLLM_STARTUP_OBSERVER") == "1":
++        try:
++            from startup_observer import emit as _startup_observer_emit
++            _startup_observer_emit("worker_preallocation",
++                vllm_config=vllm_config,
++                kv_cache_config=kv_cache_config,
++                shared_layers=get_shared_kv_cache_layers(vllm_config),
++                forward_context=forward_context,
++                kernel_block_sizes=kernel_block_sizes,
++                device=device,
++            )
++        except Exception as _startup_observer_error:
++            try:
++                __import__("sys").stderr.write(
++                    "[STARTUP_OBSERVER_INCOMPLETE] stage=worker_preallocation import_or_call_error="
++                    + type(_startup_observer_error).__name__ + "\n"
++                )
++            except Exception:
++                pass
++    # STARTUP_OBSERVER_END worker_preallocation
+     with allocation_context:
+         kv_caches = allocate_kv_cache(
+             kv_cache_config,
+@@ -242,6 +263,29 @@
+         num_attn_module,
+         kv_cache_groups=kv_cache_config.kv_cache_groups,
+     )
++    # STARTUP_OBSERVER_BEGIN worker_postbind
++    if __import__("os").environ.get("VLLM_STARTUP_OBSERVER") == "1":
++        try:
++            from startup_observer import emit as _startup_observer_emit
++            _startup_observer_emit("worker_postbind",
++                vllm_config=vllm_config,
++                kv_cache_config=kv_cache_config,
++                shared_layers=get_shared_kv_cache_layers(vllm_config),
++                forward_context=forward_context,
++                kernel_block_sizes=kernel_block_sizes,
++                device=device,
++                raw_tensors=kv_caches,
++                kv_caches=kv_caches,
++            )
++        except Exception as _startup_observer_error:
++            try:
++                __import__("sys").stderr.write(
++                    "[STARTUP_OBSERVER_INCOMPLETE] stage=worker_postbind import_or_call_error="
++                    + type(_startup_observer_error).__name__ + "\n"
++                )
++            except Exception:
++                pass
++    # STARTUP_OBSERVER_END worker_postbind
+     return kv_caches
+ 
+ 

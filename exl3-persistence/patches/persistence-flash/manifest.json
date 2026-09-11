@@ -1,0 +1,72 @@
+{
+  "upstream_commit": "83252ea899c6538eaa0c1fb31f28a92c661bbffc",
+  "patches": [
+    {
+      "file": "0001-drained-outcome-api.patch",
+      "sha256": "70d7c94e2c454b8c39378de37b2a43dbcd8a41327c25e21bff3570ce7f9e2ea6"
+    },
+    {
+      "file": "0002-offloading-failure-frontiers.patch",
+      "sha256": "86179342eb0741e4637e5fbf56cadf66b094ef9f94a4b616231e93721da58d46"
+    },
+    {
+      "file": "0003-grouped-recovery-ordering.patch",
+      "sha256": "cd9ca29ab28f3dc3f1d21c45a253d61200dcc9e95c22010e2e230a961713177f"
+    },
+    {
+      "file": "0004-finished-store-frontier.patch",
+      "sha256": "63dc7935020c4c4264d338babe1b926aa771bcb9ec1a44937a378658240322a5"
+    }
+  ],
+  "files": {
+    "vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py": {
+      "before": "9b3f042c6fa1581d10e8f688d2d9bc927bb41b780a9ea01f514d57228e20c978",
+      "after": "025387946e8bf1487483ab77af8b079051aa26e164cac1bbc77bd0467b7be041",
+      "anchors": [
+        "class DirectionalTransferStats:"
+      ]
+    },
+    "vllm/v1/kv_offload/base.py": {
+      "before": "ea648adaa4c8b960623c75de4c483539c16a2da2d911ab4c666feca3dd52474b",
+      "after": "777f39753bb7e252b251afbcee859dcd2625d6044124ca54e203c4532c93a8dc",
+      "anchors": [
+        "class ReqContext:"
+      ]
+    },
+    "vllm/v1/kv_offload/cpu/manager.py": {
+      "before": "b8cbe365f0d3e8603fe7b64ad61ff1fce395216a22c3fae72f9c019981a1349a",
+      "after": "535916b9372df1e01f8b709148e85be8030c9b4b9583999d8d290ebb9a4542e1",
+      "anchors": [
+        "class CPUOffloadingManager(OffloadingManager):"
+      ]
+    },
+    "vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py": {
+      "before": "d8b010831e5422c6c1e56f679b72acc6771660afd68f4eb802c0f4e633763727",
+      "after": "c4770936b342b5c193aafcccc93d2c452f7b5c69e71a7f44e6f7721e6e149d93",
+      "anchors": [
+        "class OffloadingConnectorWorker:"
+      ]
+    },
+    "vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py": {
+      "before": "f6b4bbde339e4ffa0507392c22af66c5f0ca8266f0980ff2965cd5eeaab525f2",
+      "after": "75b8cadb44b5d7404974921ebab7a2f0fe9cf4c9529b45fd539ecc88a0ad9545",
+      "anchors": [
+        "class TransferJobStatus:"
+      ]
+    },
+    "vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py": {
+      "before": "06bdf20e17d63a683c9a5e1e9c86cb4c530e1312c7e4731713e2bb7e025ef802",
+      "after": "6fb06a0cf74c01ec2446c8d0bbd5630d3aec25416aceed5adba0261940b41b25",
+      "anchors": [
+        "class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):"
+      ]
+    },
+    "vllm/v1/core/sched/scheduler.py": {
+      "before": "1982646c37da6fde3b0943db8caf200469d80baa33e9195b131f88ba4d55771d",
+      "after": "1cfcfa7095455c56292cb4914843002a9cbb52722bf73f0455de330ed8b24d20",
+      "anchors": [
+        "class Scheduler(SchedulerInterface):"
+      ]
+    }
+  }
+}

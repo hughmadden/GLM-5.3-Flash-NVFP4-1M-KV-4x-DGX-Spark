@@ -1,0 +1,30 @@
+Recipe Persistence
+Copyright 2026 Hugh Madden and contributors
+Licensed under Apache License 2.0; see LICENSE.
+
+ARCHITECTURAL PROVENANCE
+The rank-local metadata-only scheduler, held durable store completion,
+per-group unpadded memoryviews, and bounded streaming ring are adapted from
+Hugh Madden's Apache-2.0 nodelocal_disk_spec.py:
+upstream attribution gist (gist id 03f369339b709a80fd594f4083702722)
+Retained source blob: 9c365a4fa5cf42164ef9b40d9528eeb334afed49.
+The retained source declares SPDX-License-Identifier: Apache-2.0.
+
+MODIFICATIONS
+This package ports the native paired-handler ABI, separates portable modules,
+replaces the unbounded residency log with bounded SQLite, adds checksums,
+file/directory fsync ordering, hard reservation accounting, rank-consensus
+interfaces, renewable leases, tombstone collection and CPU fault fixtures.
+No old model-specific group exceptions, deployment configuration, shell janitor,
+or broad divisor patch is reproduced. The tombstone-before-unlink design is
+retained; the janitor implementation is new and has no external shell/SSH calls.
+
+NATIVE INTERFACE
+Copyright contributors to the vLLM project (Apache-2.0).
+https://github.com/vllm-project/vllm/tree/ab666069935c1f23e8ef56038b4659ac9e8f19f8
+Native OffloadingSpec/OffloadingManager/OffloadingHandler interfaces and
+CpuGpuOffloadingHandlers are imported from the installed pinned runtime;
+the runtime implementation is not vendored into this package.
+
+The parent recipe's NOTICE remains applicable to the recipe. This package does
+not grant model-weight or drafter licenses and does not modify their terms.

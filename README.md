@@ -1,5 +1,21 @@
 # GLM-5.3-Flash · DFlash2 · TP4 · 1M Context · 3.9M-Token KV
 
+> **This is a fork, and the fork is additive.**
+>
+> Upstream (`tonyd2wild/GLM-5.3-Flash-NVFP4-1M-KV-4x-DGX-Spark`) is the TP4 operational playbook for
+> four DGX Sparks, and everything in it below is unaltered: his recipe, images, launcher scripts,
+> probes and found documents are exactly as published.
+>
+> This fork adds one separate lane under **[`exl3-persistence/`](exl3-persistence/)**: serving the
+> **EXL3 4-bit** build of GLM-5.3-Flash at TP4 on the same four nodes, with a **rank-local disk KV
+> persistence tier** active from first boot, plus the patches, harnesses and measured findings that
+> came out of it. Nothing upstream is modified; the two trees can be read independently.
+>
+> If you want the NVFP4/DFlash2 TP4 recipe, read on below. If you want the EXL3 + disk-KV lane, start
+> at [`exl3-persistence/README.md`](exl3-persistence/README.md).
+>
+> Upstream's files retain their own terms; the licence in `exl3-persistence/` covers that subtree only.
+
 > 🔀 **Only have two Sparks?** The same images run at TP2 (262K context) — see the sibling repo:
 > **[GLM-5.3-Flash NVFP4 + DFlash2 · 2x DGX Spark →](https://github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark)**
 

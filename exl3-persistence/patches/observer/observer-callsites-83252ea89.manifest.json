@@ -1,0 +1,25 @@
+{
+  "schema": "vllm-startup-observer-callsite-port-v1",
+  "source_tree": "vllm @ 83252ea899c6538eaa0c1fb31f28a92c661bbffc",
+  "ported_from": "vllm @ ab6660699 (persistence/local-nvme build/prepare_startup_observer.py EXPECTED pins)",
+  "generator": "$WORK/port/prepare_startup_observer_83252ea89.py",
+  "modules": {
+    "vllm/v1/core/kv_cache_utils.py": {
+      "before_sha256": "70e289eb278f96bd4a49f63f7d96d533ec2f2728fbefb734ce6eb2a244c2569f",
+      "after_sha256": "7bb6792a6284f57d68b8d713fe28aa0ccfada77529ce8041b323d06ef06a001f",
+      "added_startup_hooks": 2
+    },
+    "vllm/v1/worker/gpu/attn_utils.py": {
+      "before_sha256": "e91729ae69c9d53691c76aa3617bd6a5e2712811c442678a5330c48d3afc6d7e",
+      "after_sha256": "f3314edb165561032861f2d264bf393a88f047f906f97dc280d063ae7cea9d6f",
+      "added_startup_hooks": 2
+    }
+  },
+  "observer_sha256_unchanged": "4dbfc809c8ab3d7d7fc720d5c55091e15529f03f492a5c96ef5d136dbd86207a",
+  "stages": ["engine_projection", "engine_final", "worker_preallocation", "worker_postbind"],
+  "known_incomplete_stages": {
+    "engine_final": "kv_cache_configs/available_memory not in scope at the new call site (update_kv_cache_capacity); emitter's engine_final branch requires both -> STARTUP_OBSERVER_INCOMPLETE",
+    "worker_preallocation": "attn_groups/cache_dtype dropped from init_kv_cache's NEW signature; emitter's non-engine branch requires both -> STARTUP_OBSERVER_INCOMPLETE",
+    "worker_postbind": "same attn_groups/cache_dtype gap as worker_preallocation; raw_tensors substituted with kv_caches (no raw/shaped split exists on NEW) but the branch never reaches that far"
+  }
+}

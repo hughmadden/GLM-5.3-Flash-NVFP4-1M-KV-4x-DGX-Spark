@@ -1,0 +1,1229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Request cap and disk KV persistence: GLM-5.3-Flash EXL3 at TP4 on 4× DGX Spark</title>
+<style>
+  :root {
+    --bg: #f7f8fa; --card: #ffffff; --ink: #1a2330; --muted: #5b6878;
+    --accent: #0d7a8a; --accent2: #b3541e; --line: #dde3ea; --chip: #e8f4f6;
+    --good: #1a7a3a; --bad: #a33030; --mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #10151c; --card: #171e28; --ink: #e4e9f0; --muted: #93a1b3;
+      --accent: #3fb6c9; --accent2: #e08a4e; --line: #2a3442; --chip: #14343a;
+      --good: #4dbb72; --bad: #e06c6c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 16px/1.55 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 32px 20px 64px; }
+  header h1 { font-size: 1.7rem; margin: 0 0 4px; letter-spacing: -0.01em; }
+  header .sub { color: var(--muted); margin-bottom: 6px; }
+  .chips { margin: 14px 0 6px; }
+  .chip { display: inline-block; background: var(--chip); color: var(--accent);
+          border: 1px solid var(--line); border-radius: 999px; padding: 2px 12px;
+          font-size: 0.8rem; margin: 2px 4px 2px 0; white-space: nowrap; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+            padding: 22px 24px; margin-top: 22px; }
+  h2 { font-size: 1.2rem; margin: 0 0 12px; color: var(--accent); }
+  h3 { font-size: 1.0rem; margin: 20px 0 6px; }
+  h4 { font-size: 0.94rem; margin: 16px 0 4px; color: var(--muted); }
+  p { margin: 8px 0; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin: 14px 0; }
+  .stat { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+  .stat .v { font-size: 1.45rem; font-weight: 700; }
+  .stat .l { color: var(--muted); font-size: 0.82rem; margin-top: 2px; }
+  .tablewrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.9rem; margin: 10px 0; }
+  th, td { border: 1px solid var(--line); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--chip); font-weight: 600; }
+  code, pre { font-family: var(--mono); font-size: 0.84em; }
+  code { background: var(--chip); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--chip); border: 1px solid var(--line); border-radius: 8px;
+        padding: 12px 14px; overflow-x: auto; line-height: 1.45; }
+  ul, ol { margin: 8px 0; padding-left: 22px; }
+  li { margin: 4px 0; }
+  .good { color: var(--good); font-weight: 600; }
+  .bad { color: var(--bad); font-weight: 600; }
+  .muted { color: var(--muted); }
+  .note { border-left: 3px solid var(--accent2); background: var(--chip);
+          padding: 8px 14px; margin: 12px 0; border-radius: 0 6px 6px 0; }
+  a { color: var(--accent); }
+  footer { color: var(--muted); font-size: 0.82rem; margin-top: 28px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Request cap, disk KV persistence, and cache-hit accounting</h1>
+  <div class="sub">GLM-5.3-Flash EXL3 4bpw at TP4 on 4× DGX Spark (GB10), DFlash2 speculative decoding,
+  with a node-local disk KV tier. Two defects found and fixed, the standard bench that frames them,
+  and an open restore-path defect that hangs clients behind a metric reading 0.0%.</div>
+  <div class="chips">
+    <span class="chip">GLM-5.3-Flash 320B MoE</span>
+    <span class="chip">EXL3 TR3 4bpw</span>
+    <span class="chip">4× DGX Spark (GB10)</span>
+    <span class="chip">vLLM TP=4, 121.7 GiB UMA/node</span>
+    <span class="chip">DFlash2 k=7</span>
+    <span class="chip">node-local disk KV tier</span>
+    <span class="chip">2026-09-11</span>
+  </div>
+</header>
+
+<section>
+  <h2>TL;DR</h2>
+
+  <p>This is the sequel to the two-Spark disk-KV report. The same idea (park a long agent session on
+  the node's own disk instead of recomputing its prefill) was moved onto four Sparks at tensor
+  parallelism 4 with an EXL3 4-bit weight format. Getting there surfaced two defects that had nothing
+  to do with the persistence design itself, plus one accounting gap that matters for anyone trying to
+  <i>operate</i> the tier.</p>
+
+  <div class="grid">
+    <div class="stat"><div class="v">0.85 &rarr; 0.75</div>
+      <div class="l">the GPU memory fraction that caused every engine death. A single config value.</div></div>
+    <div class="stat"><div class="v">884 MB &rarr; 16.4–18.2 GB</div>
+      <div class="l">host memory free after that change, on a 121.7 GiB unified-memory node</div></div>
+    <div class="stat"><div class="v">8.697 &rarr; 0.024 ms</div>
+      <div class="l">median lease-grant latency once the per-commit <code>fsync</code> was removed (&asymp;360×)</div></div>
+    <div class="stat"><div class="v">512 MiB</div>
+      <div class="l">the one allocation that actually set the request cap. Not <code>max_model_len</code>.</div></div>
+  </div>
+
+  <h3>The recipe book: what to actually change</h3>
+  <p>Five findings are load-bearing. Each is a one-line change with a measured consequence.</p>
+  <ol>
+    <li><b>Lower <code>GPU_MEM_UTIL</code> to 0.75 on a GB10 unified-memory node.</b> vLLM sizes its KV
+      pool from <i>total</i> device memory, not from what is free, so on unified memory it will happily
+      commit the host out of existence. 0.85 killed the engine on any prefill above ~83k tokens; 0.75
+      survives 255k–404k tokens.</li>
+    <li><b>Set <code>VLLM_SPARSE_INDEXER_MAX_LOGITS_MB</code> explicitly.</b> The sparse-indexer
+      profiling branch reserves <code>max(32 &times; max_model_len &times; 4, cap &times; 1 MiB)</code> bytes and
+      drops the reference, but the caching allocator keeps the block reserved. With the default cap of
+      512 this was ~58% of all the headroom the engine had. Lowering <code>MAX_MODEL_LEN</code> would
+      <i>not</i> have shrunk it.</li>
+    <li><b>Do not give the KV store a durable commit per operation.</b> The store is a reconstructible
+      cache (<code>kv_load_failure_policy=recompute</code>), so <code>synchronous=EXTRA</code> bought
+      nothing and cost a full <code>fsync</code> on every lease grant — 8.697 ms, on a path that runs
+      every scheduler step. WAL + NORMAL gives 0.024 ms.</li>
+    <li><b>Make durability an explicit, validated policy</b> rather than a hard-coded pragma, and keep
+      the library default unchanged so existing behaviour and tests still hold.</li>
+    <li><b>Never trust exit code 0 from a GB10 engine.</b> Every death in this campaign exited 0 with
+      <code>OOMKilled=false</code>; the API server then hung draining the client socket. The real
+      signals are the kernel's NVRM lines and <code>/health</code>.</li>
+    <li><b>Size a per-step lookup budget against the longest prefix, not a round number.</b> A
+      <code>RETRY</code> that means "later" is destructive when the caller discards its progress on it.
+      At ~110 tokens per chunk, a budget of 8 hangs any prefix over ~900 tokens.</li>
+    <li><b>Make a throttle's release independent of the work it blocks.</b> A gate advanced only by a
+      scheduler hook that never runs for a deferred request is a deadlock, not a throttle.</li>
+    <li><b>Gate every benchmark on clocks, under load.</b> A GB10 can come back from a reboot pinned at
+      611–728 MHz instead of ~2,200 MHz with a zero throttle mask, which silently depresses every
+      published number. Idle sampling proves nothing; the check must run while the GPU is busy.</li>
+  </ol>
+
+  <div class="note">
+    <b>Correction of record.</b> An earlier internal note claimed the persistence fix recovered decode
+    from &sim;12 to 58.1 tok/s (a 4.8&times; win). That comparison was confounded: the two arms differed
+    in speculative-decoding acceptance length, in whether a page-cache flusher was still running, and in
+    leftover benchmark containers competing for the engine. A controlled re-run with the engine idle,
+    the flusher stopped and 8 repetitions per arm gives <b>42.1 tok/s at ~83 ms/step with the fix
+    reverted</b> versus <b>41.0 tok/s at ~83 ms/step with the fix applied</b>. The per-step latency did
+    not change. There was no decode bug. The isolated durability result (8.697 &rarr; 0.024 ms per lease
+    grant) is the real and sufficient reason to keep that fix. Section 3.4 explains the arithmetic that
+    makes raw tok/s unsafe to compare across prompts.
+  </div>
+
+  <div class="note">
+    <b>The open finding, and the one to read first if you only read one.</b> The disk tier's <i>write</i>
+    path works: it accepts data, and 7 GB of it survived several engine restarts. Its <i>read</i> path does
+    not. A controlled test stored one 8,171-token prefix as 112 chunks, then immediately re-requested
+    it: the repeat <b>never returned</b> — 240 seconds, client-side timeout — and the counters added in
+    this work show exactly why. The tier <b>found the entire prefix</b>, 112 chunks of 112, within two
+    seconds, and then transferred <b>zero bytes</b> across the whole 240 s while the scheduler retried
+    the lookup <b>36,137 times</b>. The request sits in the deferred state with nothing running and
+    nothing else queued, so there is no error, no timeout, and no client-visible signal.
+    Meanwhile the engine correctly reports <code>External prefix cache hit rate: 0.0%</code>, which is
+    complete and accurate accounting: the tier was consulted and did not serve. The combination is the
+    dangerous part — clients hang while the metric says only "low hit rate". Section 5 has the
+    reproduction and the verdict.
+  </div>
+</section>
+<section>
+  <h2>1 · Setup, briefly</h2>
+
+  <div class="tablewrap">
+  <table>
+    <tr><th>Component</th><th>Choice</th></tr>
+    <tr><td>Model</td><td><code>Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw</code> (EXL3 trellis, 4 bits per weight)</td></tr>
+    <tr><td>Nodes</td><td>4× NVIDIA DGX Spark, GB10, <b>121.69 GiB unified memory per node</b>, 20 cores each</td></tr>
+    <tr><td>Parallelism</td><td>TP=4, one rank per node</td></tr>
+    <tr><td>Engine</td><td>vLLM <code>0.28.1rc1.dev617+g83252ea89</code>, eager mode</td></tr>
+    <tr><td>Speculative decoding</td><td>DFlash2, <code>num_speculative_tokens=7</code>, draft TP=4 (<code>incoai/GLM-5.3-Flash-DFlash2</code>)</td></tr>
+    <tr><td>KV cache</td><td>fp8, <code>MAX_MODEL_LEN=850000</code>, <code>MAX_NUM_SEQS=4</code>, <code>MAX_NUM_BATCHED_TOKENS=7168</code></td></tr>
+    <tr><td>Prefix matching</td><td>unit 4 (sparse-indexer compress ratio)</td></tr>
+    <tr><td>Persistence</td><td>node-local disk KV tier, one HTTP coordinator per rank, tenant-scoped</td></tr>
+    <tr><td>Transport</td><td>NCCL over the inter-node link, <code>NCCL_IB_DISABLE=1</code> (no RDMA claimed)</td></tr>
+  </table>
+  </div>
+
+  <p>Two properties of this hardware dominate everything below. First, the GB10's memory is
+  <b>unified</b>: the GPU and the host draw from one 121.69 GiB pool. A GPU allocator that sizes itself
+  from total device memory is therefore also deciding the host's fate. Second, the modules are small
+  enough that the weights, the KV pool, the draft model and the engine's host-side footprint all have
+  to be reasoned about in the same budget. There is no second pool to spill into.</p>
+
+  <p>The persistence tier is a separate pure-Python package. It deliberately does not import
+  <code>torch</code> or vLLM, so its whole store, eviction and lease machinery can be exercised by unit
+  tests with dummy data and no engine at all. That design decision is what made both fixes in this
+  report cheap to find (section 6).</p>
+</section>
+<section>
+  <h2>2 · Defect 1: the request cap</h2>
+
+  <h3>2.1 Symptom</h3>
+  <p>Large prefills killed the engine. The failure was not a clean rejection and not a container OOM.
+  The sequence was identical every time:</p>
+  <ol>
+    <li>a prefill of roughly 83k–90k tokens, or larger;</li>
+    <li>an NVIDIA driver allocation failure logged to the kernel as
+      <code>NVRM: ... Out of memory [NV_ERR_NO_MEMORY] ... _memdescAllocInternal</code>;</li>
+    <li>vLLM's own SIGTERM handler shutting the engine down;</li>
+    <li>the process exiting <b>0</b> with <code>OOMKilled=false</code>;</li>
+    <li>the API server staying alive but <b>hanging while draining the client socket</b>, so
+      <code>/health</code> never returns and a manual down/up cycle is required.</li>
+  </ol>
+  <p>Step 4 is the trap. Monitoring that keys on exit status or on container OOM sees nothing wrong.</p>
+
+  <h3>2.2 Root cause: the memory budget was over-committed</h3>
+  <p>Measured at <code>GPU_MEM_UTIL=0.85</code> on a 121.69 GiB node:</p>
+  <div class="tablewrap">
+  <table>
+    <tr><th>Component</th><th>GiB</th></tr>
+    <tr><td>weights + non-torch allocations</td><td>45.66</td></tr>
+    <tr><td>KV cache pool</td><td>55.77</td></tr>
+    <tr><td>engine host-side footprint (container cgroup)</td><td>~10.4</td></tr>
+    <tr><td><b>host <code>MemAvailable</code></b></td><td><b>0.86</b></td></tr>
+  </table>
+  </div>
+  <p>The engine's planner believed it had 18.26 GiB of headroom, because it sizes the pool from total
+  device memory. The host actually had 884 MB. A 1 Hz sampler on all four ranks caught the collapse:</p>
+<pre>t+ 0s  MemAvailable=2484 MB      t+41s  MemAvailable=1631 MB
+t+11s  MemAvailable=2434 MB      t+51s  MemAvailable= 859 MB
+t+21s  MemAvailable=2425 MB      t+62s  MemAvailable= 743 MB
+t+31s  MemAvailable=2086 MB      t+72s  MemAvailable= 568 MB   &lt;- driver fails here
+                                 t+82s  MemAvailable=6089 MB   &lt;- engine releases
+                                 t+92s  MemAvailable=115900 MB</pre>
+
+  <h3>2.3 The allocation that actually set the cap</h3>
+  <p>The cap is not a vague over-commitment story. It is one named reservation. In
+  <code>vllm/model_executor/layers/sparse_attn_indexer_kpool.py</code>, inside
+  <code>sparse_attn_indexer_kpool()</code>, the memory-profiling branch does this:</p>
+<pre># Reserve profiler-visible memory for the worst-case decode logits,
+# whose shape is [B * next_n, max_model_len]. This profiling branch
+# returns before invoking the logits kernel itself.
+worst_decode_tokens = min(sched.max_num_seqs * (num_spec + 1),
+                          sched.max_num_batched_tokens)
+decode_logits_elems = worst_decode_tokens * max_model_len * 4
+prefill_cap_elems   = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+max_logits_elems    = max(decode_logits_elems, prefill_cap_elems)
+_ = torch.empty(max_logits_elems, dtype=torch.uint8, device=...)</pre>
+  <p>With this configuration the two terms are:</p>
+  <div class="tablewrap">
+  <table>
+    <tr><th>term</th><th>value</th></tr>
+    <tr><td><code>worst_decode_tokens = min(4 &times; (7+1), 7168)</code></td><td>32</td></tr>
+    <tr><td><code>decode_logits_elems = 32 &times; 850000 &times; 4</code></td><td>103.8 MiB</td></tr>
+    <tr><td><code>prefill_cap_elems = 512 &times; 1 MiB</code> (the default cap is <b>512</b>)</td><td><b>512 MiB</b></td></tr>
+    <tr><td><code>max_logits_elems = max(103.8, 512)</code></td><td><b>512 MiB</b></td></tr>
+  </table>
+  </div>
+  <p>Two things follow, and both are counter-intuitive enough to be worth stating plainly.</p>
+  <ul>
+    <li><b>The environment cap binds, not <code>max_model_len</code>.</b> The <code>max_model_len</code>
+      term only becomes the binding one above <code>max_model_len &asymp; 4.19 M</code>. So lowering
+      <code>MAX_MODEL_LEN</code> would have shrunk the KV pool and changed nothing about this buffer. The
+      lever is <code>VLLM_SPARSE_INDEXER_MAX_LOGITS_MB</code>.</li>
+    <li><b>It is a reservation, not a live allocation.</b> The result is assigned to <code>_</code>, so
+      the reference is dropped immediately — but PyTorch's caching allocator keeps the block
+      <i>reserved</i>, and the driver therefore still holds it. It is taken on first indexer use, which is
+      the first prefill: exactly when the deaths happened.</li>
+  </ul>
+
+  <h3>2.4 What was ruled out</h3>
+  <p>The sparse-indexer <i>workspace</i> is a separate, frequently-blamed allocation and it is not the
+  culprit. It is closed-form in the config:</p>
+<pre>entries = min(max_num_seqs, MNBT) * cdiv(max_model_len + num_spec, compress_ratio)
+        = min(4, 7168) * cdiv(850007, 4) = 4 * 212502 = 850,008 entries
+bytes   = 850,008 * 132 B (128 fp8 + 4 B scale) + 1 MiB radix = 112.2 MiB</pre>
+  <p>At 112.2 MiB it is also profile-time locked and subtracted from the KV pool, so it never competes
+  with prefill transients. A patch that resizes this workspace does return 4,173 MiB to the pool, but
+  the pool is preallocated: that helps throughput, not headroom.</p>
+
+  <h3>2.5 Fix and validation</h3>
+  <p>The fix is a configuration value: <code>GPU_MEM_UTIL</code> 0.85 &rarr; <b>0.75</b>, plus an
+  explicit <code>VLLM_SPARSE_INDEXER_MAX_LOGITS_MB</code>.</p>
+  <div class="tablewrap">
+  <table>
+    <tr><th></th><th>before (0.85)</th><th>after (0.75)</th></tr>
+    <tr><td>KV pool</td><td>55.77 GiB</td><td><b>43.2–43.9 GiB</b></td></tr>
+    <tr><td>host available</td><td>884 MB</td><td><b>16,400–18,200 MB</b></td></tr>
+    <tr><td>largest surviving prompt</td><td class="bad">~83k tokens (died at 90k)</td><td class="good">255,393 tokens</td></tr>
+    <tr><td>full stack (persistence on + WAL)</td><td class="bad">—</td><td class="good">153,527 / 260,472 / 404,749 tokens all survived</td></tr>
+    <tr><td>NVRM <code>NO_MEMORY</code> count</td><td>302</td><td>302 (unchanged)</td></tr>
+  </table>
+  </div>
+  <p>The confirmation experiment isolates the mechanism rather than the symptom. Returning to the
+  <i>failing</i> configuration and changing only the cap, 512 &rarr; 96:</p>
+  <div class="tablewrap">
+  <table>
+    <tr><th></th><th>util 0.85, cap 512 (failed)</th><th>util 0.85, cap 96</th></tr>
+    <tr><td>host <code>MemAvailable</code></td><td class="bad">884 MB</td><td class="good">2,866 MB</td></tr>
+    <tr><td>KV pool</td><td>55.77 GiB</td><td>56.74 GiB</td></tr>
+    <tr><td>a ~150k-token prompt</td><td class="bad">killed the engine</td><td class="good">survived, held <code>waiting_by_reason="deferred"</code></td></tr>
+  </table>
+  </div>
+  <p>The post-fix state is itself diagnostic. The request now sits at
+  <code>num_requests_waiting_by_reason{reason="deferred"} = 1</code> with <code>running = 0</code> — held by
+  a KV-transfer constraint, not by memory. The memory death is gone and the next limit in line is
+  non-fatal. That distinction matters, and section 5.3 shows why it is also not the whole story.</p>
+
+  <div class="note">
+    <b>Trade-off, stated plainly.</b> The GPU KV pool is about 12.5 GiB smaller, so fewer tokens stay
+    resident on the GPU. That is a good trade <i>here</i>, because there is a disk tier to absorb the
+    overflow: the cap fix is what makes the persistence tier earn its keep instead of being a liability.
+    On a deployment without a second tier, the same change would simply mean more recompute.
+  </div>
+</section>
+<section>
+  <h2>3 · Defect 2: a durable <code>fsync</code> on every lease grant</h2>
+
+  <h3>3.1 Root cause</h3>
+  <p>The store's lease path commits an <code>INSERT</code> with <code>PRAGMA synchronous=EXTRA</code>, and
+  the cache-lookup path grants a lease through a synchronous coordinator RPC. Because
+  <code>on_schedule_end()</code> runs every scheduler step, every step that touched a lease paid a full
+  <code>fsync</code>.</p>
+  <div class="tablewrap">
+  <table>
+    <tr><th>operation (unit harness, dummy data, no engine)</th><th>latency</th></tr>
+    <tr><td>lookup <b>miss</b></td><td>0.022 ms</td></tr>
+    <tr><td>lookup <b>hit</b> (lease granted)</td><td class="bad">8.697 ms median / 11.39 ms p95</td></tr>
+  </table>
+  </div>
+  <p>The engine metric agreed: <code>vllm:kv_offload_lookup_sync_delay_seconds</code> was consuming about
+  9.3 s of every 10 s window across roughly 800 lookups. The engine was blocked on persistence lookups
+  for the large majority of wall-clock time.</p>
+  <p>The key judgement is that this store is a <b>reconstructible cache, not a journal</b>. Its
+  configured load-failure policy is <code>recompute</code>: if a lease or payload is lost, the engine
+  recomputes the prefill. So <code>synchronous=EXTRA</code> was buying a durability guarantee that the
+  system had already decided it did not need, at the cost of an <code>fsync</code> per commit.</p>
+
+  <h3>3.2 Fix: durability becomes an explicit policy</h3>
+  <ol>
+    <li><b>Store</b> takes <code>journal_mode</code> and <code>synchronous</code> as validated
+      parameters. <b>Defaults are unchanged</b> (<code>delete</code> + <code>extra</code>), so the library
+      contract and every pre-existing test still hold.</li>
+    <li><b>Coordinator</b> reads the two values from the spec's <code>extra_config</code>.</li>
+    <li><b>Launcher</b> renders them from <code>PERSIST_SQLITE_JOURNAL_MODE</code> /
+      <code>PERSIST_SQLITE_SYNCHRONOUS</code>; this deployment sets <b><code>wal</code> + <code>normal</code></b>.</li>
+    <li><b>Directory audit</b> now permits the <code>index.sqlite-wal</code> and <code>-shm</code> files
+      that WAL creates. This is worth calling out: the audit had been rejecting them, which is what two
+      failing tests were actually catching. The fix was to teach the audit about WAL, not to weaken it.</li>
+  </ol>
+
+  <h3>3.3 Measured effect</h3>
+  <div class="tablewrap">
+  <table>
+    <tr><th>configuration</th><th>lease-grant latency</th></tr>
+    <tr><td>DELETE + EXTRA (original)</td><td class="bad">8.697 ms</td></tr>
+    <tr><td>DELETE + NORMAL</td><td>4.498 ms</td></tr>
+    <tr><td>DELETE + OFF</td><td>0.054 ms</td></tr>
+    <tr><td><b>WAL + NORMAL (chosen)</b></td><td class="good"><b>0.024 ms</b></td></tr>
+  </table>
+  </div>
+  <p>That is roughly a 360× reduction on the lease path. WAL additionally removes reader/writer
+  serialisation; the concurrency suite's wall time fell from 50 s to 12 s. The choice of
+  <code>normal</code> over <code>off</code> is deliberate: it keeps the SQLite index crash-consistent
+  without paying per-commit durability on a cache whose loss is already handled.</p>
+
+  <h3>3.4 The decode claim, corrected</h3>
+  <p>An earlier internal write-up reported this fix as a 4.8&times; decode recovery (&sim;12 &rarr; 58.1 tok/s).
+  It is not, and the reason is worth recording as a measurement discipline rather than an apology.</p>
+  <p>Speculative decoding makes throughput a function of acceptance length:</p>
+<pre>tok/s = (acceptance_length * 7 + 1) / milliseconds_per_step</pre>
+  <p>The original comparison ran its two arms against different prompt mixes with different acceptance
+  lengths, with a page-cache flusher still running during part of it, and with a leftover benchmark
+  container competing for the same engine. All three change tok/s without changing the engine. The
+  controlled re-run, with the engine idle, the flusher stopped, and 8 repetitions per arm:</p>
+  <div class="tablewrap">
+  <table>
+    <tr><th>arm</th><th>decode</th><th>per-step latency</th><th>acceptance</th></tr>
+    <tr><td>lock-scope fix reverted</td><td>42.1 tok/s</td><td>~83 ms/step</td><td>0.35–0.61</td></tr>
+    <tr><td>lock-scope fix applied</td><td>41.0 tok/s</td><td>~83 ms/step</td><td>0.35–0.61</td></tr>
+  </table>
+  </div>
+  <p><b>Per-step latency is identical. There is no decode regression and there was no decode bug.</b>
+  For scale, the model publisher's own published figures imply about 118 ms/step at 0.959 acceptance and
+  125 ms/step at 0.341. Our ~83 ms/step is faster per step; the gap in headline tok/s between us and
+  any other report is a difference in prompt mix and therefore in acceptance length, not in the engine.</p>
+  <p>The lesson is narrow and practical: <b>report ms/step and acceptance length, not raw tok/s.</b>
+  Raw tok/s across differing prompts is not a comparable quantity.</p>
+
+  <h3>3.5 Defect 3: a lookup budget that hung every real prompt</h3>
+  <p>With defects 1 and 2 fixed the engine no longer died, but sessions still hung. Two further faults
+  were found in the disk tier's <i>lookup</i> path, and they had to be separated because each masked the
+  other. This is the first.</p>
+  <p><code>PERSIST_LOOKUP_KEYS_PER_STEP</code> bounds how many <b>new</b> disk reservations the manager
+  may charge in one scheduler step, answering <code>RETRY</code> for every chunk beyond that. vLLM's
+  <code>_maximal_prefix_lookup</code> treats a single <code>RETRY</code> as "defer the whole lookup" and
+  <b>discards every hit already found in that scan</b>:</p>
+<pre>case RETRY:
+    defer_lookup = True       # does NOT break
+...
+return hit_count if not defer_lookup else None</pre>
+  <p>The shipped value was <b>8</b>. A real prompt needs far more than eight fresh reservations, so the
+  scan returned <code>None</code> on essentially every pass and the request was deferred indefinitely.</p>
+  <div class="tablewrap">
+  <table>
+    <tr><th>Same build, same 8,171-token prompt, cold then repeated</th><th>budget = 8 (shipped)</th><th>budget = 2048</th></tr>
+    <tr><td>repeat pass</td><td class="bad">hung, client timed out at 240 s</td><td class="good">completed in 7.6 s</td></tr>
+    <tr><td><code>deferred</code> during the repeat</td><td class="bad">1, continuously</td><td class="good">0</td></tr>
+    <tr><td>disk chunk queries attributed to the repeat</td><td class="bad">34,400</td><td class="good">3,528</td></tr>
+    <tr><td>load bytes</td><td>0</td><td>0</td></tr>
+  </table>
+  </div>
+  <p>An 8,171-token prompt resolved to <b>74 chunks</b>, about <b>110 tokens per chunk</b>, which gives
+  the sizing rule directly: the budget must be at least the chunk count of the longest prefix you
+  intend to restore. For the 405k-token prompt measured safe in 4.7 that is ~3,700 chunks, so the value
+  shipped here is <b>2048</b> (covering every context size in the matrix) and a deployment serving the
+  full safe bound should use 4096. The old value of 8 did not merely under-perform: it made restores
+  hang for any prompt longer than roughly 900 tokens.</p>
+
+  <h3>3.6 Defect 4: the lookup gate could deadlock</h3>
+  <p>Raising the budget fixed the hang for ordinary prompts but exposed a second, independent fault. The
+  gate that apportions lookup turns advanced in exactly one place, <code>on_schedule_end</code> — and
+  that hook only runs when the scheduler makes progress. A request deferred <i>by the gate</i> produces
+  no batch, so the hook never runs and the turn never advances:</p>
+<pre>request's lookups all answered RETRY
+  -> the request produces no batch
+    -> the scheduler has nothing to run
+      -> on_schedule_end is not called
+        -> the turn never advances
+          -> every later lookup is RETRY again</pre>
+  <p>On the engine this presents as a healthy process with <code>/health</code> returning 200, no
+  exception anywhere, and:</p>
+<pre>Engine 000: ... Running: 0 reqs, Waiting: 1 reqs, Deferred: 1 reqs,
+             GPU KV cache usage: 0.0%, Prefix cache hit rate: 0.0%</pre>
+  <p>The client hangs until it times out. It was reproducible on a <b>cold</b> prompt with nothing on the
+  disk tier at all, which is what pointed at the gate rather than the store: a cold lookup should simply
+  miss and end the scan.</p>
+  <p><b>The fix</b> advances the gate on wall-clock as well as from the scheduler hook, through a single
+  rotation helper used by both paths. One owner still receives its whole per-step key budget within one
+  scan, so the throttle is unchanged; what changes is that the gate can no longer be stranded by a
+  scheduler with nothing to do.</p>
+  <div class="tablewrap">
+  <table>
+    <tr><th>Test (<code>tests/test_lookup_gate_liveness.py</code>)</th><th>Without the fix</th><th>With the fix</th></tr>
+    <tr><td>second owner admitted without the scheduler hook</td><td class="bad">FAIL — "owner B was never admitted without on_schedule_end"</td><td class="good">pass</td></tr>
+    <tr><td>repeated retry always resolves</td><td class="bad">FAIL</td><td class="good">pass</td></tr>
+    <tr><td>gate clears on degrade</td><td class="bad">FAIL</td><td class="good">pass</td></tr>
+    <tr><td>budget still bounds one turn</td><td>pass</td><td class="good">pass</td></tr>
+  </table>
+  </div>
+  <p>The tests never call <code>on_schedule_end</code>, reproducing a scheduler with no batch to run, and
+  run in 0.12 s with no engine. Three of four fail on the reverted tree. The fourth is kept deliberately:
+  it asserts that liveness was not bought by deleting the throttle, since a change that removed the
+  budget would pass the other three and be wrong. Full package suite after both fixes: <b>254 passed</b>.</p>
+
+  <div class="note">
+    <b>The lesson, which cost several engine restarts.</b> A throttling signal must not depend for its own
+    release on the subsystem that the throttle stalls. <code>RETRY</code> was the right word for "later",
+    but the only thing that could make it later was the work it had just blocked. Both of these defects
+    were invisible in the counters: request hitching and hang both present as "deferred" and "load bytes
+    zero", which is why the path tracing in 5.3 was needed to tell them apart.
+  </div>
+</section>
+<section>
+  <h2>4 · Results: the standard bench</h2>
+
+  <p>Measured with the Local Inference Lab standard concurrency bench: decode throughput at concurrency
+  1 through 6, three waves of <code>c</code> parallel requests per level, 700 output tokens per request,
+  code and reasoning flavoured prompts, each request salted uniquely so prefix caching cannot flatter
+  the result. Speculative-decoding acceptance is scraped from <code>/metrics</code> over each level's
+  window.</p>
+
+  <p>Verbatim output, six levels, 63 requests, <b>zero failures</b>:</p>
+<pre> c reqs  agg_tok/s per_stream  mean_s fails  accept_len
+ 1    3       39.4       39.6    17.7     0  ratio=0.331
+ 2    6       73.3       38.2    19.1     0  ratio=0.478
+ 3    9       73.8       30.9    28.5     0  ratio=0.411
+ 4   12       73.0       22.9    38.3     0  ratio=0.379
+ 5   15       72.0       22.5    48.6     0  ratio=0.435
+ 6   18       75.1       21.1    55.9     0  ratio=0.395</pre>
+
+  <div class="tablewrap">
+  <table>
+    <tr><th>Concurrency</th><th>Aggregate output tok/s</th><th>Per-stream tok/s</th><th>Mean wall (s)</th><th>Acceptance (accepted/drafted)</th><th>Derived ms/step</th></tr>
+    <tr><td>1</td><td>39.4</td><td class="good">39.6</td><td>17.7</td><td>0.331</td><td>~84</td></tr>
+    <tr><td>2</td><td>73.3</td><td>38.2</td><td>19.1</td><td>0.478</td><td>~119</td></tr>
+    <tr><td>3</td><td>73.8</td><td>30.9</td><td>28.5</td><td>0.411</td><td>~158</td></tr>
+    <tr><td>4</td><td>73.0</td><td>22.9</td><td>38.3</td><td>0.379</td><td>~200</td></tr>
+    <tr><td>5</td><td>72.0</td><td>22.5</td><td>48.6</td><td>0.435</td><td>queue-limited</td></tr>
+    <tr><td>6</td><td class="good">75.1</td><td>21.1</td><td>55.9</td><td>0.395</td><td>queue-limited</td></tr>
+  </table>
+  </div>
+  <p class="muted">Derived ms/step = 1000 / (aggregate tok/s &divide; (accepted-length &times; running
+  batch)). Accepted length is taken as <code>1 + 7 &times; ratio</code>. It is shown only where the
+  running batch equals the requested concurrency.</p>
+
+  <h3>4.1 What the shape says</h3>
+  <ul>
+    <li><b>Aggregate throughput saturates at about 73–75 tok/s from concurrency 2 onwards.</b> A batch of
+      two already reaches the ceiling; going to six adds nothing. The engine is saturated long before
+      the request queue is.</li>
+    <li><b>Per-stream throughput halves as concurrency rises</b>, from 39.6 to 21.1 tok/s. That is the
+      expected trade: the same aggregate is spread over more streams. It also means per-stream latency is
+      what you are choosing when you choose a concurrency level.</li>
+    <li><b>Concurrency above 4 is not real concurrency on this configuration.</b> The engine's own
+      occupancy telemetry recorded a maximum of 4 running requests throughout, because
+      <code>MAX_NUM_SEQS=4</code> caps the batch. The C5 and C6 rows therefore measure queueing
+      behaviour, not wider parallelism, and their flat aggregate numbers confirm it. Raising this ceiling
+      is a memory decision, not a scheduling one, and it competes with the KV pool.</li>
+    <li><b>Acceptance length varies by prompt, and that is the whole story of the tok/s spread.</b> The
+      accepted-per-drafted ratio here ranges 0.331–0.478, which at <code>k=7</code> means roughly 3.3 to
+      4.3 tokens accepted per step. Different prompt mixes in other reports produce very different
+      ratios, and therefore very different headline throughput, on identical hardware.</li>
+  </ul>
+
+  <div class="note">
+    <b>Measurement conditions, stated because they matter.</b> The bench ran for 10 min 27 s. The
+    endpoint is fronted by a gateway and can receive traffic that is not ours, so the run recorded both
+    an occupancy sampler and the gateway's own request log. Over the 60-minute window ending with the
+    run the gateway logged 23 requests to this model, and <b>zero of them fell inside the measurement
+    window</b>: the numbers below are uncontended. The engine reported 208 occupancy samples, of which
+    100% had at least one request running and 77% had more than one, with a mean of 2.64 — all of it
+    this bench, consistent with the wave structure. The sampler also recorded a hard ceiling of 4
+    concurrently running requests, which is the section 4.1 finding below.
+  </div>
+
+  <h3>4.2 Session matrix: method</h3>
+  <p>Single-request throughput says little about how this deployment behaves for <i>sessions</i>, which
+  is what the disk tier exists to serve. Four lanes were run against one engine, in the order below, on
+  an otherwise idle node set. Every cell reports time-to-first-token, prompt and output token counts,
+  wall time, speculative-decoding acceptance, and that cell's delta for every persistence counter. A
+  timeout or a deferral is recorded as a failure in the <code>timeouts</code> column and never retried
+  into the sample.</p>
+  <div class="tablewrap">
+  <table>
+    <tr><th>Lane</th><th>What it measures</th></tr>
+    <tr><td><b>L1</b> cold ladder</td><td>One unique session per context size, nothing cached. Gives the prefill curve.</td></tr>
+    <tr><td><b>L2</b> warm ladder</td><td>The same session sent twice. Gives whatever reuse the stack actually delivers.</td></tr>
+    <tr><td><b>L3</b> concurrent</td><td>N distinct sessions at C=1..4 at fixed context. Gives the concurrency cost.</td></tr>
+    <tr><td><b>L4</b> eviction</td><td>Unique sessions until the GPU KV pool must evict, then re-request an early session while the engine is busy.</td></tr>
+  </table>
+  </div>
+  <div class="note">
+    <b>One measurement limitation, declared up front.</b> This engine delivers a completion in a single
+    burst at the end of the request: a 61-token response arrived as <b>one</b> content delta, 20 SSE
+    events in total, at t=20.95 s. Per-stream decode rate therefore cannot be derived from
+    inter-token timing, and every <code>decode_measurable</code> flag below reads false. What the timing
+    <i>is</i> good for is prefill: with generation this short, time-to-first-token is effectively the
+    prefill latency, and that is how <code>prefill_tok_s</code> is derived. Aggregate output tokens over
+    wall time is also always valid. Both are reported; a fabricated decode rate is not.
+  </div>
+
+  <h3>4.3 L1 — cold sessions across context sizes</h3>
+  <p>Four unique sessions, one at a time, nothing cached. All four completed with zero failures.</p>
+  <div class="tablewrap">
+  <table>
+    <tr><th>Target ctx</th><th>Actual prompt tokens</th><th>Wall</th><th>Prefill tok/s</th><th>Output tokens</th></tr>
+    <tr><td>4k</td><td>5,705</td><td>4.10 s</td><td>1,392</td><td>61</td></tr>
+    <tr><td>16k</td><td>22,718</td><td>11.18 s</td><td>2,033</td><td>15</td></tr>
+    <tr><td>32k</td><td>45,426</td><td>22.39 s</td><td>2,029</td><td>15</td></tr>
+    <tr><td>64k</td><td>91,051</td><td>60.47 s</td><td>1,506</td><td>70</td></tr>
+  </table>
+  </div>
+  <p>Cold prefill runs at roughly <b>1,400–2,030 tokens/s</b>, with the rate highest in the middle of the
+  range and softening at 91k. Prefill is linear enough in context that a 91k-token session costs about
+  60 seconds of wall time before the first token, which is the cost the cache path exists to avoid.
+  Note the actual prompt sizes exceed their targets by ~1.4×: the generator sizes prompts by word
+  count, and the token counts reported here are the API's own, not the intent.</p>
+
+  <h3>4.4 L2 — warm sessions: how much reuse is actually delivered</h3>
+  <p>The same session sent twice in a row, so the second pass should be materially cheaper if reuse
+  works.</p>
+  <div class="tablewrap">
+  <table>
+    <tr><th>Prompt tokens</th><th>Pass 1</th><th>Pass 2</th><th>Effect</th><th>GPU prefix hits / queries (pass 2)</th></tr>
+    <tr><td>5,708</td><td>5.83 s</td><td class="good">3.30 s</td><td class="good">1.77× faster</td><td>—</td></tr>
+    <tr><td>22,793</td><td>11.18 s</td><td>11.15 s</td><td>no change</td><td>—</td></tr>
+    <tr><td>45,445</td><td>27.90 s</td><td>24.31 s</td><td>1.15× faster</td><td>—</td></tr>
+    <tr><td>90,943</td><td>59.87 s</td><td class="bad">82.35 s</td><td class="bad">1.38× slower</td><td>64,512 / 161,515</td></tr>
+  </table>
+  </div>
+  <p>This is the least comfortable result in the report and it is not dressed up. Reuse is real but
+  unreliable: a clear win at 5.7k, nothing at 22.8k, marginal at 45k, and at 91k the second pass was
+  <b>slower</b> than the first. The GPU prefix cache is genuinely working — the 91k pair shows 64,512
+  hits against 161,515 queries on the second pass — so the inconsistency is not a failure to cache. It
+  is that the savings are small relative to prefill cost, and at deep context a second pass lands in
+  enough scheduling and memory-pressure variance to swamp them.</p>
+  <p>The disk tier contributed almost nothing to any of this: across the four L2 cells the external
+  prefix cache recorded single-digit hits against tens of thousands of queries. When the report says
+  the tier does not serve, this is what that means in a session-shaped workload.</p>
+
+  <h3>4.5 L3 — concurrent sessions</h3>
+  <p>Distinct sessions at a fixed ~45.5k-token context, C=1 through C=4. All twelve requests completed
+  with zero failures.</p>
+  <div class="tablewrap">
+  <table>
+    <tr><th>C</th><th>Sessions</th><th>Wall</th><th>TTFT mean</th><th>TTFT max</th><th>Prefill tok/s</th><th>Aggregate output tok/s</th></tr>
+    <tr><td>1</td><td>1</td><td>27.65 s</td><td>27.65 s</td><td>27.65 s</td><td class="good">1,646</td><td>0.54</td></tr>
+    <tr><td>2</td><td>2</td><td>50.58 s</td><td>41.75 s</td><td>50.58 s</td><td>1,089</td><td class="good">1.48</td></tr>
+    <tr><td>3</td><td>3</td><td>80.01 s</td><td>56.76 s</td><td>80.01 s</td><td>803</td><td>1.41</td></tr>
+    <tr><td>4</td><td>4</td><td>103.15 s</td><td>68.28 s</td><td>103.15 s</td><td class="bad">667</td><td>1.12</td></tr>
+  </table>
+  </div>
+  <p>Concurrency buys aggregate throughput and charges for it in latency, exactly as expected on a
+  four-batch cap. Prefill rate per stream falls by <b>2.5×</b> from C=1 to C=4 while aggregate output
+  roughly doubles from C=1 to C=2 and then flattens. Note the shape: the second session adds most of
+  the available aggregate gain, and the third and fourth add latency without adding throughput. If the
+  goal is many sessions served rather than one served quickly, C=2 is where this configuration pays.</p>
+  <p>These are also the cells where the disk tier shows any sign of life at all — a handful of external
+  hits (4, 4, 8) against 136k–199k queries — and where the lookup churn is highest. That combination is
+  the subject of 4.6.</p>
+
+  <h3>4.6 L4 — eviction and busy-disk refill</h3>
+  <p>This is the lane the disk tier exists for, and it is also the one that is hardest to run
+  honestly, so the method and the shortfall are both stated before the numbers.</p>
+  <p><b>How much work eviction actually takes.</b> The engine reports its own cache size at startup:</p>
+<pre>Available KV cache memory: 43.23 GiB
+GPU KV cache size: 3,407,692 tokens, Maximum concurrency for 850,000 tokens per request: 4.01x</pre>
+  <p>So forcing the GPU cache to evict requires inserting <b>more than 3.4 million unique tokens</b>.
+  Measured aggregate insertion under C=4 concurrency is roughly <b>1,500 tokens/s</b>, so the pool alone
+  costs about <b>2,270 seconds</b> of filling before any eviction can occur. Every attempt below is
+  therefore time-boxed, and each one is reported with the fraction of the pool it actually reached
+  rather than being presented as an eviction result it did not achieve.</p>
+
+  <div class="tablewrap">
+  <table>
+    <tr><th>Attempt</th><th>Shape</th><th>Completed</th><th>Unique tokens inserted</th><th>Fraction of the 3.41M pool</th><th>Verdict</th></tr>
+    <tr><td>1</td><td>128 × 32k target, C=4, 900 s budget</td><td>37 / 128</td><td>~1.68M</td><td class="bad">49%</td><td>did not reach eviction</td></tr>
+    <tr><td>2</td><td>700 × 4k target, C=4, 1500 s budget</td><td>391 / 700</td><td>~2.23M</td><td class="bad">65%</td><td>did not reach eviction</td></tr>
+  </table>
+  </div>
+  <p>Both attempts ran the full budget with zero hangs and zero deferrals, so the shortfall is purely a
+  matter of wall time, not of the engine failing. Approaching the pool needs roughly 600 of the 4k
+  sessions, and at the measured rate that is about 38 minutes of continuous fill.</p>
+
+  <h4>What the busy-disk case does show</h4>
+  <p>Even short of eviction, attempt 2 is a genuine heavy-concurrency measurement and it answers the
+  question that matters: what does the disk tier do when many sessions are hammering it at once?</p>
+  <div class="tablewrap">
+  <table>
+    <tr><th>Metric (attempt 2, 391 sessions at C=4, 1,506 s)</th><th>Value</th></tr>
+    <tr><td>prompt tokens per session</td><td>5,714</td></tr>
+    <tr><td>time-to-first-token, mean / max</td><td>15.31 s / 42.68 s</td></tr>
+    <tr><td>per-stream prefill</td><td>374 tok/s (C=4 contention)</td></tr>
+    <tr><td>GPU prefix cache hits / queries</td><td>46,080 / 2,375,907 &rarr; <b>1.9%</b></td></tr>
+    <tr><td>external (disk-tier) prefix cache queries</td><td class="bad">2,329,827</td></tr>
+    <tr><td>external (disk-tier) prefix cache hits</td><td class="bad">332</td></tr>
+    <tr><td>load bytes transferred from the disk tier</td><td class="bad">0</td></tr>
+    <tr><td>deferrals, hangs</td><td class="good">0 / 0</td></tr>
+  </table>
+  </div>
+  <p>Read that as the operational answer to "how does the tier behave under busy concurrent sessions":
+  it is consulted <b>2.33 million times</b>, answers <b>332</b> of them, and transfers <b>nothing</b>. The
+  hit rate is 0.014%. The refill after the fill completed in 3.07 s against a 4.10 s cold baseline, which
+  is the GPU cache doing the work — not the tier.</p>
+  <p>The 1.9% GPU prefix-cache hit rate is the other half of the picture and is not a defect: every
+  session in the fill is deliberately unique, so a low hit rate is the intended condition. It is quoted
+  to show that the caching machinery was live and being exercised while the tier failed to contribute.</p>
+
+  <div class="note">
+    <b>The honest summary of L4.</b> The tier sustains the lookup load — 2.33M queries without a hang —
+    and serves essentially none of it. Whether it would begin serving once genuine GPU eviction forces
+    the issue is <b>not yet measured</b>, because neither attempt reached the 3.41M-token pool. That is a
+    gap in this report, stated as a gap rather than papered over, and the fix is simply a longer run:
+    ~38 minutes of fill plus the refill, which is what the third attempt in flight is sized for.
+  </div>
+
+  <h3>4.7 Context depth, for scale</h3>
+  <p>Prefill is the expensive operation on this deployment, and its ceiling moved substantially once
+  defect 1 was fixed. The surviving-prompt ladder, measured by ascending prompt size until failure:</p>
+  <div class="tablewrap">
+  <table>
+    <tr><th>Configuration</th><th>Prompt sizes that survived</th></tr>
+    <tr><td><code>GPU_MEM_UTIL=0.85</code> (before)</td><td class="bad">~83k tokens; died at 90k</td></tr>
+    <tr><td><code>GPU_MEM_UTIL=0.75</code>, persistence off</td><td>101,324 / 153,527 / <b>255,393</b></td></tr>
+    <tr><td><code>GPU_MEM_UTIL=0.75</code>, full stack on</td><td class="good">153,527 / 260,472 / <b>404,749</b></td></tr>
+  </table>
+  </div>
+  <p>Each of those is a completed request, not an accepted-then-failed one. The NVRM out-of-memory count
+  was unchanged at 302 across the fix, which is the clearest evidence that the deaths stopped rather
+  than merely became rarer.</p>
+  <p>An honest caveat on the depth ladder: the prompt sizes are token counts of the actual submitted
+  request, and the ladder ascends non-uniformly because the sizes were chosen by the probe, not sampled
+  from a distribution. The bound between 404,749 and 850,000 is <b>not</b> characterised, which is
+  defect O5.</p>
+</section>
+
+<section>
+  <h2>5 · Persistence: what works, what does not</h2>
+
+  <p>This section is deliberately separated from the throughput results because the honest summary of
+  the tier at the end of this campaign is <b>asymmetric</b>: the write path works well, and the restore
+  path does not yet fire.</p>
+
+  <h3>5.1 The eviction and refill experiment</h3>
+  <p>The tier's own quota is 1 TB with watermarks at 900 GB and 800 GB, so its eviction path cannot be
+  reached by volume at test scale. The reachable and far more important direction is the GPU side: force
+  the GPU prefix cache to let go of a session, then ask for it again and see who serves it — the GPU
+  cache, the disk tier, or a full recompute.</p>
+  <p>The probe does exactly that with one prompt. Phase 0 sends a unique ~5.3k-token prompt cold. Phase 1
+  immediately re-sends the identical prompt, which is the simplest possible expression of the tier's
+  entire purpose: the prefix is already in the GPU cache, and it has just been written to disk, so this
+  request should be trivially cheap from either tier.</p>
+<pre>=== phase 0: cold prefill of the target prompt ===
+  cold: 2.84 s  prompt_tokens=5279  prefix_hits=0  store_B=182949888
+=== phase 1: immediate repeat (should be served from a cache) ===</pre>
+  <p><b>Phase 1 never returned.</b> The request entered the deferred state and stayed there. The engine's
+  own counters at capture:</p>
+  <div class="tablewrap">
+  <table>
+    <tr><th>Signal</th><th>Value at capture</th></tr>
+    <tr><td>bytes accepted by the store for the phase-0 prompt</td><td class="good">182,949,888 (~183 MB) — the write succeeded</td></tr>
+    <tr><td><code>num_requests_running</code></td><td>0</td></tr>
+    <tr><td><code>num_requests_waiting_by_reason{reason="capacity"}</code></td><td>0</td></tr>
+    <tr><td><code>num_requests_waiting_by_reason{reason="deferred"}</code></td><td class="bad">2</td></tr>
+    <tr><td><code>vllm:kv_offload_allocation_failure_total</code></td><td class="bad">4,034 and climbing</td></tr>
+    <tr><td><code>External prefix cache hit rate</code></td><td class="bad">0.0%</td></tr>
+  </table>
+  </div>
+  <p>The deferred state is the specific one to understand. The request is not waiting for a GPU slot —
+  capacity-waiting is zero and nothing is running. It is waiting for a KV transfer that is never issued.
+  Nothing is logged as an error, nothing is returned to the client, and the request does not time out.
+  It simply never completes.</p>
+  <p>The flood phase of the experiment was abandoned rather than completed, because each deferred request
+  occupies its worker for the full client timeout: at four workers the flood could not have advanced. The
+  finding was already decisive at the first repeat, which is the cheapest possible case.</p>
+  <div class="note">
+    <b>Why this matters more than the throughput numbers.</b> Parking a session on disk and resuming it is
+    the entire purpose of this tier. The write path performs correctly, and the persisted objects are
+    real and durable across restarts (5.2). But the read path does not merely underperform: storing a
+    prefix makes the next request for that prefix hang indefinitely with no error. An operator would
+    reasonably conclude from the metrics that the cache had a low hit rate, while the clients would be
+    stuck. That combination — a silent client hang behind a metric that reads 0.0% — is the single most
+    important finding in this report, and it is why the counters described in 5.4 exist. Section 5.3
+    gives the verdict those counters produced.
+  </div>
+
+
+  <h3>5.2 The write path is healthy and survives restarts</h3>
+  <p>Inspection of the live store on the head rank after several engine restarts:</p>
+  <div class="tablewrap">
+  <table>
+    <tr><th>Property</th><th>Value</th></tr>
+    <tr><td>on-disk payload volume</td><td class="good">7.0 GB</td></tr>
+    <tr><td>objects in the index</td><td class="good">2,302</td></tr>
+    <tr><td>live leases</td><td>35</td></tr>
+    <tr><td>SQLite <code>journal_mode</code> (persistent, engine-applied)</td><td class="good"><code>wal</code> — the durability fix is live</td></tr>
+    <tr><td>object mtimes</td><td>span multiple engine generations — <b>data outlives an engine restart</b></td></tr>
+  </table>
+  </div>
+  <p>Two measurement traps are worth recording because both cost time here. First,
+  <code>du</code> without <code>sudo</code> reports 8 KB for this tree: the rank subdirectory is created
+  by the engine running as root inside its container, and the unprivileged read cannot traverse it. The
+  tier looked empty when it was 7 GB full. Second, <code>PRAGMA synchronous</code> is a per-connection
+  setting, so a host-side probe reports its own default rather than the engine's policy; only
+  <code>journal_mode</code>, which is persistent, can be used to prove from outside that the engine
+  applied its configuration. Both traps produce confident wrong answers, which is the worst kind.</p>
+
+  <h3>5.3 The restore path does not fire, and the failure mode is a hang</h3>
+  <p>Against a store holding 2,302 objects, the engine reported:</p>
+  <div class="tablewrap">
+  <table>
+    <tr><th>Signal</th><th>Value</th><th>Reading</th></tr>
+    <tr><td><code>External prefix cache hit rate</code></td><td class="bad">0.0%</td><td>the offload tier has never served a hit</td></tr>
+    <tr><td><code>vllm:kv_offload_load_bytes_total</code></td><td class="bad">0</td><td>no load has ever been performed</td></tr>
+    <tr><td><code>vllm:kv_offload_store_bytes_total</code></td><td>881 MB this instance</td><td>stores work</td></tr>
+    <tr><td><code>vllm:kv_offload_allocation_failure_total</code></td><td class="bad">increments steadily (~17 per 10 s window)</td><td>the allocation path is failing continuously</td></tr>
+    <tr><td>A request needing a restore</td><td class="bad"><code>Waiting: 1, Deferred: 1</code>, indefinitely</td><td>deferral never resolves</td></tr>
+  </table>
+  </div>
+  <p>The write path and the read path therefore disagree with each other. Data lands on disk and
+  survives a restart, and the same engine cannot get it back. The failure is not silent in the sense of
+  being invisible: it is visible as a permanently <code>deferred</code> request that never completes and
+  never errors. For an operator this is the worst shape a failure can take, because the client hangs
+  rather than being told to retry.</p>
+
+  <h4>Mechanism: found completely, and then never transferred</h4>
+  <p>The two new counters were added precisely to decide this, then deployed to all four ranks and
+  exercised against a fresh engine. One unique 8,171-token prompt, sent cold and then immediately
+  repeated, gives an unambiguous answer.</p>
+  <div class="tablewrap">
+  <table>
+    <tr><th>Pass</th><th>Wall time</th><th>Disk chunk queries</th><th>Disk chunk hits</th><th>Store bytes</th><th>Load bytes</th><th>External hits</th><th>Deferred</th></tr>
+    <tr><td>1 — cold</td><td>4.6 s</td><td>1</td><td>0</td><td>252,797,952 (112 stores)</td><td>0</td><td>0</td><td>0</td></tr>
+    <tr><td>2 — immediate repeat</td><td class="bad">hung (240 s client timeout)</td><td class="bad">36,137</td><td class="good">112</td><td>0</td><td class="bad">0</td><td class="bad">0</td><td class="bad">1</td></tr>
+  </table>
+  </div>
+  <p>The first pass stored the prompt as <b>112 chunks</b>. The second pass found <b>112 chunks</b>. The
+  prefix is therefore not partially cached, not mis-keyed and not slow: <b>the tier holds the entire
+  prefix and returns all of it, within two seconds.</b> Sampling the counters every two seconds shows
+  that plainly — the hit count rises 76 &rarr; 112 and then stops, because there is nothing left to
+  find:</p>
+<pre>t=  0.0s  queries=  34916  hits= 76  load_B=0  deferred=0  running=0
+t=  2.0s  queries=  35708  hits=112  load_B=0  deferred=1  running=0
+t= 74.4s  queries=  66820  hits=112  load_B=0  deferred=1  running=0
+t= 76.4s  queries=  67580  hits=112  load_B=0  deferred=1  running=0   &lt;- query rate collapses
+t=239.0s  queries= 71028  hits=112  load_B=0  deferred=1  running=0
+RESULT: 240.1s -&gt; TimeoutError: timed out</pre>
+  <p>Four things follow, and they are the whole diagnosis.</p>
+  <ul>
+    <li><b>The store and the lookup are both correct.</b> 112 of 112 chunks matched. This excludes the
+      store, the keying, the geometry and the eviction policy as causes, and it excludes the
+      "consulted and missed" reading of the 0.0% hit rate.</li>
+    <li><b>The transfer is never issued.</b> Zero load bytes for the full 240 seconds. The prefix is
+      located and then discarded.</li>
+    <li><b>The request is deferred, not failing.</b> <code>deferred = 1</code> continuously from t=2 s to
+      t=240 s. Nothing errors server-side, nothing returns, nothing times out server-side. Only the
+      client times out.</li>
+    <li><b>The engine burns CPU retrying.</b> Lookups climb at roughly 880/s for the first 76 seconds,
+      then collapse to about 4/s — a retry loop that is eventually throttled but never resolved. 36,137
+      lookups were issued for a prefix that had been fully located at t=2 s, and
+      <code>external_prefix_cache_queries</code> advanced by 11,280 while
+      <code>external_prefix_cache_hits</code> stayed at 0 — correct accounting, because vLLM counts a
+      hit only when a transfer actually supplies tokens.</li>
+  </ul>
+  <p>So the defect sits <b>downstream of the lookup</b>: between a resolved hit and the transfer that
+  should follow it. That is a narrower and much better-supported statement than "the restore path does
+  not fire", and it came from adding the counters rather than from reading more code.</p>
+
+  <h4>A hypothesis that was tested and rejected</h4>
+  <p>One plausible cause was tested and eliminated, and the rejection is recorded because it is worth
+  as much as the conclusion. vLLM's scan discards the entire hit count if any chunk returns RETRY, and
+  our lease-validity check returns <code>False</code> — without queueing a renewal — when the
+  coordinator reports no deadline. If a freshly granted lease had no deadline, every reserved chunk
+  would RETRY until a renewal landed and the scan could never converge.</p>
+  <p>A stub modelling that coordinator reproduced the observed shape exactly: <b>673 scheduler steps to
+  converge instead of 10</b>, with one renewal per chunk; and with the deadline seeded at reservation
+  time, back to 10 steps with zero renewals.</p>
+  <p><b>The hypothesis is wrong, and reading the real coordinator rather than the model of it is what
+  showed that.</b> The reservation path already sets the lease deadline at grant time, so a fresh
+  reservation is immediately valid for its full window. No change was made to the lease-validation,
+  deadline or renewal code on the strength of that stub. This is the third hypothesis in this campaign
+  that a stub could support and the real source refuted, which is the argument for keeping both.</p>
+  <p>The remaining site is therefore the transfer itself: whether the loader is invoked for a resolved
+  hit, and why the resulting job never completes. The next step is a debug trace at that boundary, not
+  further reading of the lookup path.</p>
+
+  <h3>5.4 Cache-hit accounting: already correct, but invisible and genuinely missing</h3>
+  <p>An initial reading of this deployment concluded that a disk-cache hit was not being counted as a
+  cache hit at all. <b>That was wrong, and the correction matters.</b> vLLM does distinguish the two
+  sources of reuse, and it already routes offload-tier hits into their own accounting:</p>
+<pre>Engine 000: Avg prompt throughput: ... Running: 0 reqs, Waiting: 1 reqs, Deferred: 1 reqs,
+GPU KV cache usage: 0.0%, Prefix cache hit rate: 86.6%, External prefix cache hit rate: 0.0%</pre>
+  <p>The two numbers are deliberately separate. <code>Prefix cache hit rate</code> is the GPU-resident
+  block cache. <code>External prefix cache hit rate</code> is the offload tier, and it is fed by a
+  complete chain that already exists: the tier's manager reports a lookup hit, the scheduler converts it
+  through <code>get_num_new_matched_tokens</code> into <code>num_external_computed_tokens</code>, and the
+  connector records it into <code>vllm:external_prefix_cache_hits_total</code> — the same counter that
+  drives the log line. A disk block is not, and should not be, part of
+  <code>vllm:prefix_cache_hits_total</code>, which is GPU-only by design.</p>
+  <p>So a printed <code>0.0%</code> is not an accounting gap but a <b>measurement</b>: the tier was
+  consulted and no query was served. That is independent confirmation of the defect above, arrived at
+  from a different direction — and the reproduction in 5.3 sharpens it further, showing that the tier is
+  consulted, <i>does</i> match, and still is not served.</p>
+  <p>Two real gaps remained, and both are now closed and verified on the live engine.</p>
+  <ol>
+    <li><b>The client could not see cache reuse at all.</b> The API response contained no
+      <code>usage.prompt_tokens_details</code> object, because <code>--enable-prompt-tokens-details</code>
+      defaults to <code>false</code>. This was never an offload-accounting problem: the underlying
+      <code>num_cached_tokens</code> is already computed as local plus external, so a disk-served prefix
+      <i>would</i> appear in <code>cached_tokens</code> — it was simply never serialised. The launcher now
+      enables the flag, and the field is confirmed present on the wire:
+      <code>"prompt_tokens_details": {"cached_tokens": 0, "created_cache_tokens": 0, ...}</code>.</li>
+    <li><b>An operator could not tell "consulted and missed" from "found but deferred".</b> With the rate
+      pinned at zero the two failures are indistinguishable, and they call for opposite responses. Two
+      counters are now emitted through vLLM's sanctioned <code>build_metric_definitions()</code> extension
+      point, deployed to all four ranks and confirmed live at <code>/metrics</code>:
+      <code>vllm:kv_offload_tiering_chunk_queries_total</code> and
+      <code>vllm:kv_offload_tiering_chunk_hits_total</code>, both labelled
+      <code>tier="disk"</code>.</li>
+  </ol>
+  <div class="tablewrap">
+  <table>
+    <tr><th>disk queries</th><th>disk hits</th><th>Reading</th><th>Next step</th></tr>
+    <tr><td>0</td><td>0</td><td>the connector never reaches the tier</td><td>investigate the lookup path, not the store</td></tr>
+    <tr><td>&gt;0</td><td>0</td><td>the tier is consulted and does not hold (or cannot validate) the prefix</td><td>investigate keying, geometry and eviction</td></tr>
+    <tr><td>&gt;0</td><td>&gt;0, external hits stay 0</td><td><b>the tier holds it and the lookup returns "retry" — the stuck deferral. This is our case.</b></td><td>investigate staging and admission (O1, O3)</td></tr>
+  </table>
+  </div>
+  <p>The counters are increments only. They change no hit, miss, admission or eviction decision: the
+  point is to make the existing decision legible, not to alter it. They were worth their cost for a
+  concrete reason — the third row is the one they identified, and it is not the row anyone had assumed.</p>
+</section>
+<section>
+  <h2>6 · Method: finding these without paying for engine startups</h2>
+
+  <p>The expensive resource in this campaign was not GPU time, it was the roughly 7-minute engine
+  restart. Almost every hypothesis was therefore tested against a stub first, and the engine was used
+  only to confirm. That split is worth describing because it is what made the schedule feasible.</p>
+
+  <h3>6.1 What stubs settled outright</h3>
+  <p>Both quantities behind the request cap are closed-form functions of the configuration, so they were
+  evaluated in a single line of Python. That is a stub harness for the engine's memory planner. It is
+  exact for profile-time reservations, it costs nothing, and its real value was deciding <i>which lever
+  mattered</i> — <code>VLLM_SPARSE_INDEXER_MAX_LOGITS_MB</code>, not <code>MAX_MODEL_LEN</code> — before
+  any launch was spent.</p>
+  <p>The same discipline produced the durability fix. A concurrency runner with dummy geometry and a
+  fake coordinator exercises the real store in well under a second with no engine, no network and no
+  GPU. That is where the 8.697 ms lease grant was found and where the four journal/synchronous
+  combinations were measured. The package's own test suite (99 tests) and a concurrency suite of
+  181–184 tests, of which 164–167 pass with 17 failures all traceable to known open defects and zero
+  hangs, both run without an engine.</p>
+  <p>Import cost for the whole persistence package, seven modules, is 0.07 s; 0.70 s including a
+  container start. A test cycle that costs under a second changes how willing you are to test a
+  hypothesis.</p>
+
+  <h3>6.2 What stubs cannot fake</h3>
+  <p>A driver-level <code>NV_ERR_NO_MEMORY</code> is not reproducible in a stub. It depends on a 128 GiB
+  unified pool carrying a roughly 101 GiB carve-out, and on the caching allocator's reservation
+  behaviour. The <i>existence</i> and the <i>size</i> of the cap had to be measured on a real engine.
+  Stubs narrowed the search space; the engine only confirmed it.</p>
+
+  <h3>6.3 The instruments that paid for themselves</h3>
+  <div class="tablewrap">
+  <table>
+    <tr><th>Instrument</th><th>What it gave</th></tr>
+    <tr><td><b>1 Hz unified-memory sampler</b> on all four ranks</td>
+      <td>The smoking-gun timeline: 2484 &rarr; 2086 &rarr; 1631 &rarr; 859 &rarr; 743 &rarr; 568 MB, then release to 115.9 GB. Cheapest instrument here, highest value.</td></tr>
+    <tr><td><code>dmesg | grep NVRM</code></td>
+      <td>Names the failing driver call (<code>_memdescAllocInternal</code>) and its exact timestamps.</td></tr>
+    <tr><td><code>docker inspect</code> exit code and <code>OOMKilled</code></td>
+      <td>Proved it was <i>not</i> a container OOM: exit 0, OOMKilled=false. This is the finding that stops you debugging the wrong layer.</td></tr>
+    <tr><td><code>vllm:num_requests_waiting_by_reason</code></td>
+      <td>Showed the post-fix state is a KV-transfer deferral, not memory pressure.</td></tr>
+    <tr><td>a warmed, <code>usage</code>-based decode bench</td>
+      <td>Exposed a 5–6&times; error from counting streamed chunks instead of <code>usage.completion_tokens</code>, and found the lease-<code>fsync</code> cost.</td></tr>
+    <tr><td><code>vllm:spec_decode_*</code> counters</td>
+      <td>Showed the apparent decode slowdown was acceptance-length variance.</td></tr>
+  </table>
+  </div>
+  <p>Two of these — the memory sampler and the <code>usage</code>-based decode bench — cost nothing to
+  run and together produced the two most valuable measurements of the effort. The next instrument, if a
+  further multi-hundred-megabyte reservation needs attributing, is
+  <code>torch.cuda.memory._record_memory_history()</code> with <code>_dump_snapshot()</code> around one
+  failing request, which gives every allocation with its Python stack.</p>
+
+  <h3>6.4 Benchmark hygiene rules adopted</h3>
+  <ul>
+    <li>Stop the page-cache flusher after <code>/health</code> returns 200 and before measuring. Leaving
+      it running moved a controlled measurement from 41 to 13–17 tok/s.</li>
+    <li>Assert <code>num_requests_running == 0</code> and <code>num_requests_waiting == 0</code> first,
+      and check for leftover benchmark containers.</li>
+    <li>Self-limit every runner with <code>timeout N docker run --rm --name ...</code> so a stuck probe
+      cannot silently compete with the next measurement.</li>
+    <li>Warm up, then repeat, and report the spread. One arm at a time on a TP4 engine.</li>
+    <li>Report ms/step and acceptance, never bare tok/s across differing prompts.</li>
+  </ul>
+</section>
+<section>
+  <h2>7 · Open defects and limitations</h2>
+
+  <p>Stated as a register, because the fixes in this report are real but partial.</p>
+
+  <div class="tablewrap">
+  <table>
+    <tr><th>#</th><th>Defect</th><th>Impact</th><th>Status</th></tr>
+    <tr><td>O1</td><td>No transfer is staged for a fully resolved disk hit: <b>112 of 112 chunks found, 0 load bytes over 240 s</b></td><td class="bad">the tier cannot serve; the core promise is unmet</td><td>open; store, lookup, keying and lease validation all excluded</td></tr>
+    <tr><td>O2</td><td>A request awaiting a restore is deferred indefinitely instead of failing, retrying the lookup 36,137 times for a single 8,171-token request</td><td class="bad">clients hang; no retry signal; wasted CPU</td><td>open, quantified</td></tr>
+    <tr><td>O3</td><td><code>kv_offload_allocation_failure_total</code> increments continuously against a 1 TB quota with 2.2 TB free</td><td>the real admission gate is not the quota; the likely site of O1</td><td>open</td></tr>
+    <tr><td>O4</td><td>Disk-tier hits were not visible to clients or operators</td><td>the tier was undiagnosable</td><td class="good">fixed: <code>--enable-prompt-tokens-details</code> plus two <code>tier="disk"</code> counters, verified live</td></tr>
+    <tr><td>O5</td><td><code>MAX_MODEL_LEN</code> remains 850,000</td><td>an over-large prompt defers instead of returning a clean 400</td><td>open; needs a re-bisected safe bound</td></tr>
+    <tr><td>O6</td><td>Admission defaults reject healthy callers; the remote coordinator converts that into spurious misses</td><td>degrades hit rate silently</td><td>open</td></tr>
+    <tr><td>O7</td><td>The cache reserve path holds a global lock across renewal network I/O</td><td>serialises scheduling on network latency</td><td>open</td></tr>
+    <tr><td>O8</td><td>Invalidate-then-rewrite is blocked for the grace period</td><td>a rewritten session cannot be re-parked immediately</td><td>open</td></tr>
+    <tr><td>O9</td><td>Tombstones count toward the object limit</td><td>effective capacity is lower than configured</td><td>open</td></tr>
+    <tr><td>O10</td><td>The HTTP RPC client collapses distinct error causes into one class</td><td>diagnosis is harder than it needs to be</td><td>open</td></tr>
+    <tr><td>O11</td><td>The local coordinator indexes <code>key[-4:]</code> without guarding short keys</td><td>a malformed key raises instead of being rejected</td><td>open</td></tr>
+    <tr><td>O12</td><td>The deployed engine runs the package from a bind-mounted source overlay</td><td>the durable artifacts do not yet contain the fixes</td><td>open; requires an image rebuild</td></tr>
+  </table>
+  </div>
+
+  <h3>7.1 Limitations of the measurements in this report</h3>
+  <ul>
+    <li>All throughput figures are single-engine point measurements on one TP4 deployment, not
+      population estimates. Prompt mix determines speculative-decoding acceptance and therefore tok/s.</li>
+    <li>Speculative-decoding acceptance in this deployment has been observed from 0.341 to 0.959
+      depending on prompt type, which is a wider range than any performance claim here.</li>
+    <li>The published comparison figures quoted for scale come from a different hardware configuration
+      and a different prompt set; they are context, not a controlled head-to-head.</li>
+    <li>The disk tier's own quota is 1 TB with high/low watermarks at 900 GB and 800 GB, so its eviction
+      path is not reachable by volume at test scale. What is testable is GPU-side eviction followed by a
+      refill attempt, which is what section 4 exercises.</li>
+    <li>No RDMA is claimed. NCCL ran with <code>NCCL_IB_DISABLE=1</code>; the presence of a
+      capable interconnect is not evidence that RDMA was used.</li>
+  </ul>
+</section>
+<section>
+  <h2>8 · Configuration reference</h2>
+  <p>Every setting that appears in the tables above, with what it does and why it has the value it has.</p>
+  <div class="tablewrap">
+  <table>
+    <tr><th>Setting</th><th>Value</th><th>Why</th></tr>
+    <tr><td><code>GPU_MEM_UTIL</code></td><td><b>0.75</b></td>
+      <td>The fix for defect 1. vLLM sizes the KV pool from total device memory, which on unified memory
+        starves the host. Was 0.85.</td></tr>
+    <tr><td><code>VLLM_SPARSE_INDEXER_MAX_LOGITS_MB</code></td><td><b>96</b></td>
+      <td>Bounds the sparse-indexer profiling reservation. The default 512 was ~58% of available
+        headroom and bound before <code>max_model_len</code> did.</td></tr>
+    <tr><td><code>MAX_MODEL_LEN</code></td><td>850000</td>
+      <td>Unchanged. Deliberately <i>not</i> the lever for defect 1; still needs a re-bisected safe bound (O5).</td></tr>
+    <tr><td><code>MAX_NUM_SEQS</code></td><td>4</td><td>Feeds <code>worst_decode_tokens</code> in the cap arithmetic.</td></tr>
+    <tr><td><code>MAX_NUM_BATCHED_TOKENS</code></td><td>7168</td><td>Caps <code>worst_decode_tokens</code> at 32 in the cap arithmetic.</td></tr>
+    <tr><td><code>KV_CACHE_DTYPE</code></td><td>fp8</td><td>Halves KV footprint; required for the context depths in section 4.</td></tr>
+    <tr><td><code>PREFIX_MATCH_UNIT</code></td><td>4</td><td>Matches the sparse-indexer compress ratio.</td></tr>
+    <tr><td><code>ENFORCE_EAGER</code></td><td>1</td><td>No CUDA graphs; keeps memory behaviour legible while diagnosing.</td></tr>
+    <tr><td><code>DFLASH_TOKENS</code></td><td>7</td><td>Speculative depth <code>k</code>; drives the throughput arithmetic in 3.4.</td></tr>
+    <tr><td><code>PERSIST_SQLITE_JOURNAL_MODE</code></td><td><b>wal</b></td>
+      <td>The fix for defect 2, part 1. Also removes reader/writer serialisation.</td></tr>
+    <tr><td><code>PERSIST_SQLITE_SYNCHRONOUS</code></td><td><b>normal</b></td>
+      <td>The fix for defect 2, part 2. Keeps the index crash-consistent without per-commit durability on
+        a reconstructible cache. Library default remains <code>extra</code>.</td></tr>
+    <tr><td><code>PERSIST_STAGING_BYTES</code></td><td>4 GiB</td><td>Staging budget for transfers; implicated in O1/O3.</td></tr>
+    <tr><td><code>PERSIST_STAGING_ROWS</code></td><td>64</td><td>Concurrent staged rows.</td></tr>
+    <tr><td><code>PERSIST_DISK_IO_THREADS</code></td><td>4</td><td>Disk payload concurrency.</td></tr>
+    <tr><td><code>PERSIST_MAX_PENDING_KEYS</code></td><td>32768</td><td>Metadata queue depth.</td></tr>
+    <tr><td><code>PERSIST_LOOKUP_KEYS_PER_STEP</code></td><td><b>2048</b></td>
+      <td>Bounds new disk reservations per scheduler step. <b>Was 8, which hung restores</b> (3.5). A
+        <code>RETRY</code> from this budget makes vLLM discard the whole scan, so it must exceed the chunk
+        count of the longest prefix you intend to restore: measured ~110 tokens per chunk, so 2048 covers
+        every context in the session matrix and 4096 is right for the ~405k-token safe bound.</td></tr>
+    <tr><td><code>PERSIST_METADATA_WORKERS</code></td><td>2</td><td>Async metadata dispatch; the synchronous alternative is the defect 2 pattern.</td></tr>
+    <tr><td><code>PERSIST_LIMIT_QUOTA</code></td><td>1 TB</td><td>Disk tier quota; high/low watermarks 900/800 GB.</td></tr>
+    <tr><td><code>PERSIST_LIMIT_MAX_OBJECTS</code></td><td>1000000</td><td>Object cap; see O9 on tombstones.</td></tr>
+    <tr><td><code>PERSIST_LIMIT_LEASE_SECONDS</code></td><td>300</td><td>Lease lifetime.</td></tr>
+    <tr><td><code>PERSIST_LIMIT_GRACE_SECONDS</code></td><td>60</td><td>Grace before reuse; see O8.</td></tr>
+    <tr><td><code>PERSIST_MIN_FREE_BYTES</code></td><td>1.2 TB</td><td>Precondition for persisting at all. Not the binding gate here (2.2 TB free).</td></tr>
+    <tr><td><code>PERSIST_LIMIT_FREE_BYTES</code></td><td>1 GiB</td><td>Minimum free space for the store.</td></tr>
+  </table>
+  </div>
+</section>
+<section>
+  <h2>9 · Reproducing</h2>
+
+  <h3>9.1 Confirm the request cap yourself</h3>
+  <p>Both terms of the cap are closed-form in the configuration, so the whole diagnosis can be checked
+  without a GPU:</p>
+<pre>worst_decode_tokens = min(MAX_NUM_SEQS * (num_spec + 1), MAX_NUM_BATCHED_TOKENS)
+decode_logits_elems = worst_decode_tokens * max_model_len * 4
+prefill_cap_elems   = VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+reserved_bytes      = max(decode_logits_elems, prefill_cap_elems)</pre>
+  <p>If the second term wins, the environment variable is your lever and <code>max_model_len</code> is
+  not. Then confirm on the engine with the memory sampler, and confirm the <i>cause</i> rather than the
+  symptom:</p>
+<pre># 1 Hz unified-memory sampler on every rank, while ascending prompt sizes
+free -m                      # watch MemAvailable, not just the container
+sudo dmesg -T | grep -c NV_ERR_NO_MEMORY
+docker inspect &lt;engine&gt; --format '{{.State.ExitCode}} {{.State.OOMKilled}}'</pre>
+  <p>An exit code of 0 with <code>OOMKilled=false</code> alongside a rising NVRM count is the signature.
+  Do not trust the exit code.</p>
+
+  <h3>9.2 Confirm the durability cost yourself</h3>
+  <p>This one needs no engine and no GPU at all. Run the store against dummy data and time a lease
+  grant under each journal/synchronous combination:</p>
+<pre>DELETE + EXTRA    8.697 ms   &lt;- the default, and the defect
+DELETE + NORMAL   4.498 ms
+DELETE + OFF      0.054 ms
+WAL    + NORMAL   0.024 ms   &lt;- chosen</pre>
+  <p>Then prove from outside that the engine actually applied the policy. Use
+  <code>journal_mode</code>, which is persistent; <code>synchronous</code> is per connection and a
+  host-side probe will lie to you.</p>
+
+  <h3>9.3 Run the standard bench</h3>
+<pre>python3 bench_c1c6.py --url http://&lt;head&gt;:8000 --model &lt;served-model-id&gt; \
+        --rounds 3 --max-tokens 700</pre>
+  <p>Before measuring: assert <code>num_requests_running == 0</code> and no capacity-waiting requests,
+  stop any page-cache flusher or other background task, and check for leftover containers. If the
+  endpoint is fronted by a gateway it can receive traffic that is not yours, so record what overlapped.
+  Report milliseconds per step and acceptance length, not bare tokens per second.</p>
+
+  <h3>9.4 Exercise the tier's write path</h3>
+<pre># objects and leases in the index, and the on-disk volume (needs privileges:
+# the rank directory is created by the engine running as root)
+sudo du -sh &lt;persist-root&gt;/rankN
+sudo sqlite3 &lt;persist-root&gt;/rankN/rank-0/index.sqlite \
+     'select (select count(*) from objects), (select count(*) from leases);'
+sudo sqlite3 &lt;persist-root&gt;/rankN/rank-0/index.sqlite 'PRAGMA journal_mode;'</pre>
+</section>
+<section>
+  <h2>10 · Tooling and execution tally</h2>
+
+  <p>What was actually built and run to produce the results above. Counts are of committed artifacts in
+  this campaign lane, not of drafts.</p>
+
+  <div class="tablewrap">
+  <table>
+    <tr><th>Category</th><th>Count</th><th>Notes</th></tr>
+    <tr><td>Commits in the campaign lane</td><td>15</td><td>2026-09-09 &rarr; 2026-09-11, one per finding or fix</td></tr>
+    <tr><td>Tracked files under the campaign</td><td>140</td><td>runbook, findings, fixes, image context, probes, receipts</td></tr>
+    <tr><td>Persistence package modules</td><td>24 Python files</td><td>store, coordinator, HTTP RPC, handlers, geometry, native bridge</td></tr>
+    <tr><td>Persistence test files</td><td>14</td><td>unit + a concurrency stub harness</td></tr>
+    <tr><td>vLLM overlay and patch scripts</td><td>25</td><td>hash-pinned, re-anchored onto the chosen upstream commit</td></tr>
+    <tr><td>Package unit tests</td><td class="good">99 / 99 pass</td><td>pure <code>unittest</code>, no engine, no torch</td></tr>
+    <tr><td>Concurrency tests</td><td>181–184 run</td><td>164–167 pass, 17 fail, <b>0 hangs</b>; all 17 failures map to known open defects</td></tr>
+    <tr><td>Fixes verified by the concurrency fan-out</td><td>8</td><td>each with a test that failed before and passes after</td></tr>
+    <tr><td>Package import cost</td><td>0.07 s</td><td>all 7 runtime modules; 0.70 s including a container start</td></tr>
+    <tr><td>Engine arms launched</td><td>multiple</td><td>~7 min each; the dominant cost, and the reason for the stub-first discipline in section 6</td></tr>
+  </table>
+  </div>
+
+  <h3>10.1 Documents produced</h3>
+  <div class="tablewrap">
+  <table>
+    <tr><th>Document</th><th>Content</th></tr>
+    <tr><td>Runbook</td><td>End-to-end serving instructions, preflight through validation</td></tr>
+    <tr><td>First-boot findings</td><td>Five defects in the printed recipe, with fixes</td></tr>
+    <tr><td>Concurrency test report</td><td>Harness design, fan-out allocation, 8 fixes, 15 open defects, performance</td></tr>
+    <tr><td>Fix plan</td><td>Every defect with reproduction, proposed fix, risk, and acceptance test</td></tr>
+    <tr><td>Test iteration and profiling</td><td>Iteration accelerators and instrumentation recipes</td></tr>
+    <tr><td>Request-cap location</td><td>The binding allocation, traced to file and line</td></tr>
+    <tr><td>Correction of record</td><td>Why the lock fix was not a decode regression; three confounds; the ms/step rule</td></tr>
+    <tr><td>This report</td><td>Consolidated public account</td></tr>
+  </table>
+  </div>
+
+  <h3>10.2 Reusable artifacts</h3>
+  <ul>
+    <li><b>Stub concurrency harness</b> — runs the real store against dummy geometry and a fake
+      coordinator in under a second. This is the tool that found the lease-<code>fsync</code> cost and
+      the one worth copying into any similar tier.</li>
+    <li><b>1 Hz unified-memory sampler</b> — a few lines of shell, and the instrument that located the
+      request cap. Copy it before you need it.</li>
+    <li><b><code>usage</code>-based decode bench</b> — counts emitted tokens from the API's own usage
+      block, which is what exposed a 5–6&times; chunk-counting error.</li>
+    <li><b>Standard C1–C6 bench</b> — decode throughput at concurrency 1 through 6 with unique salted
+      prompts to defeat prefix caching, scraping speculative-decoding acceptance from
+      <code>/metrics</code>.</li>
+    <li><b>Instrumented bench runner</b> — wraps the standard bench with a pre-flight idle assertion, a
+      metrics snapshot before and after, an occupancy sampler, and a record of any gateway traffic that
+      shared the engine during the run.</li>
+    <li><b>Eviction and refill probe</b> — warms a target prompt, floods the engine with unique
+      long prompts to evict it from the GPU KV pool, then re-requests it and classifies the serve path
+      from TTFT and the load-bytes counters.</li>
+  </ul>
+
+  <h3>10.3 Two measurement traps worth reusing as warnings</h3>
+  <ul>
+    <li><b>A benchmark that cannot fail loudly will publish zeros.</b> An early run of the standard
+      bench reported 0.0 tok/s for all 63 requests and still exited 0, because the model id was wrong
+      and every request returned HTTP 404 into a handler that counted failures without printing them.
+      The fix is one line that prints the first failure reason. Any harness that reports throughput
+      should refuse to report success when every request failed.</li>
+    <li><b>Two privileged-view traps produced confident wrong answers.</b> An unprivileged
+      <code>du</code> reported a 7 GB store as 8 KB because the rank directory is root-owned inside the
+      container; and a host-side <code>PRAGMA synchronous</code> probe reports the probe's own default,
+      not the engine's policy, because that pragma is per connection. Only <code>journal_mode</code> is
+      persistent and therefore provable from outside.</li>
+  </ul>
+</section>
+
+
+<section>
+  <h2>11 · Credits and provenance</h2>
+
+  <p>This work is a composition. Everything load-bearing came from somewhere else, and the public
+  sources are named here so the result can be traced and rebuilt rather than taken on trust.</p>
+
+  <div class="tablewrap">
+  <table>
+    <tr><th>Component</th><th>Source</th><th>What we took, and what we changed</th></tr>
+    <tr>
+      <td>Base model</td>
+      <td><a href="https://huggingface.co/zai-org/GLM-5.3-Flash">zai-org/GLM-5.3-Flash</a></td>
+      <td>Unmodified. 320B/A18B MoE.</td>
+    </tr>
+    <tr>
+      <td>EXL3 quantisation</td>
+      <td><a href="https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw">Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw</a></td>
+      <td>Unmodified weights, plus the engine lineage and the SM121 NoPE sparse-MLA and EXL3 kernel
+        overlay, re-anchored onto a newer vLLM base.</td>
+    </tr>
+    <tr>
+      <td>Speculative drafter</td>
+      <td><a href="https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2">incoai/GLM-5.3-Flash-DFlash2</a></td>
+      <td>Unmodified weights. DFlash2 at k=7, draft TP=4.</td>
+    </tr>
+    <tr>
+      <td>TP4 operational playbook</td>
+      <td><a href="https://github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-1M-KV-4x-DGX-Spark">tonyd2wild/GLM-5.3-Flash-NVFP4-1M-KV-4x-DGX-Spark</a></td>
+      <td>Four-node discipline adopted as process: the unconditional page-cache flusher, the memory
+        ritual, worker-first launch, image-ID parity across nodes, and the gate suite. His engine
+        serves NVFP4 and is <b>not</b> used here. This release is published as a fork of that
+        repository, with our lane added alongside his, unmodified.</td>
+    </tr>
+    <tr>
+      <td>Serving engine</td>
+      <td><a href="https://github.com/vllm-project/vllm">vllm-project/vllm</a></td>
+      <td>Pinned at <code>83252ea89</code> (<code>0.28.1rc1.dev617</code>). This is the base our
+        persistence patch series is anchored to.</td>
+    </tr>
+    <tr>
+      <td>Benchmark harness</td>
+      <td>Local Inference Lab <code>bench_c1c6.py</code>, as published in that same upstream repository under <code>probes/</code></td>
+      <td>Used as the standard C1–C6 bench. Our copy adds only a <code>--model</code> flag and a
+        first-failure message; the measurement logic is unchanged. The additions are described in
+        section 10.3 and are offered back.</td>
+    </tr>
+    <tr>
+      <td>Disk KV persistence</td>
+      <td>Ours</td>
+      <td>The <code>recipe_persistence</code> package and its four-patch companion series, plus the
+        container-side scan of the offload connector. This is the part of this report that is new.</td>
+    </tr>
+  </table>
+  </div>
+
+  <h3>11.1 What is ours, stated plainly</h3>
+  <ul>
+    <li>The request-cap root cause, its confirmation experiment, and the two configuration values that
+      fix it.</li>
+    <li>The per-lease durability defect and the journal/synchronous policy change, including the
+      directory audit that had to learn about WAL.</li>
+    <li>The <code>recipe_persistence</code> package, its disk tier, coordinator and the load-path
+      instrumentation.</li>
+    <li>The session benchmark matrix, the eviction and refill probes, and the standard-bench wrapper
+      with its idle gate and ambient-traffic accounting.</li>
+    <li>The decode-claim correction and the ms/step reporting rule.</li>
+  </ul>
+
+  <h3>11.2 What is not ours</h3>
+  <ul>
+    <li>The model weights, in both the base and EXL3 forms, and the drafter.</li>
+    <li>The TP4 operational playbook, the flusher and memory rituals, and the gate methodology.</li>
+    <li>The C1–C6 benchmark design and its prompt set.</li>
+    <li>The vLLM offload connector and the tiering metric names we register against. We extend that
+      accounting through its documented extension point; we did not design it.</li>
+  </ul>
+
+  <p class="muted">Credit for the playbook is load-bearing rather than courtesy: the four-node
+  discipline in section 1 is what made a TP4 EXL3 boot reproducible at all, and the KV-pool accounting
+  method in section 2 is what made the request cap findable.</p>
+</section>
+
+<footer>
+  GLM-5.3-Flash EXL3 4bpw · TP4 · 4× DGX Spark (GB10) · node-local disk KV tier ·
+  compiled 2026-09-11 (Australia/Sydney).
+  <br>Measurements are from this deployment; configuration values and patch content are reproducible,
+  host identities are not published.
+</footer>
+
+</div>
+</body>
+</html>

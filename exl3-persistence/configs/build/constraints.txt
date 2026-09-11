@@ -1,0 +1,28 @@
+# pip constraint file for the GLM-5.3-Flash EXL3 TP4 image.
+#
+# Purpose: the five pinned wheels are installed from /opt/wheels by path, but
+# every transitive dependency resolves ONLINE. This file stops that resolution
+# from moving anything ABI-critical.
+#
+# torch: vLLM nightly 83252ea89's own METADATA declares Requires-Dist:
+# torch==2.13.0 (build-receipts/vllm-nightly-METADATA.txt on build-host). PEP 440 says a
+# public-version specifier ignores local labels, so this is satisfied by the
+# 2.13.0+cu130 wheel we install by path. Every compiled artifact in this image
+# -- vLLM's own kernels, flashinfer-jit-cache, exllamav3_ext -- links this ABI.
+torch==2.13.0
+
+# FlashInfer: 0.6.18.post1, NOT bare 0.6.18. The nightly wheel pins post1
+# explicitly; receipts/build-host/wheels/MANIFEST.md flags that vLLM *stable* 0.29.0
+# pins bare 0.6.18 and the nightly moved on. Getting this wrong silently gives a
+# jit-cache built for the other point release.
+flashinfer-python==0.6.18.post1
+flashinfer-cubin==0.6.18.post1
+flashinfer-jit-cache==0.6.18.post1+cu130
+
+# torch 2.13.0's own Requires-Dist (torch METADATA). Restated so an online
+# resolve cannot drift the CUDA userspace out from under the sm_121a fatbins.
+nvidia-nccl-cu13==2.29.7
+nvidia-cudnn-cu13==9.20.0.48
+nvidia-cusparselt-cu13==0.8.1
+nvidia-nvshmem-cu13==3.4.5
+cuda-bindings>=13.0.3,<14

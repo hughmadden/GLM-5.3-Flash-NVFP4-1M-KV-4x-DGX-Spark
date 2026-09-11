@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "recipe-persistence"
+version = "0.1.0"
+description = "Bounded rank-local disk KV persistence for the pinned native vLLM offloading ABI"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["recipe_persistence*"]
+namespaces = false

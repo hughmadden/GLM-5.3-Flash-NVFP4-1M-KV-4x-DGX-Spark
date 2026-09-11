@@ -1,0 +1,164 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py
+@@ -84,10 +84,14 @@
+ 
+     completed_jobs: dict[int, int] = field(default_factory=dict)
+     transfer_stats: TransferStats = field(default_factory=TransferStats)
++    failed_jobs: set[int] = field(default_factory=set)
++    failed_load_blocks: dict[int, set[int]] = field(default_factory=dict)
+ 
+-    def mark_completed(self, job_id: int) -> None:
+-        """Record a transfer job completion from this worker."""
++    def mark_completed(self, job_id: int, success: bool = True) -> None:
++        """Record one drained outcome, including failed submissions."""
+         self.completed_jobs[job_id] = 1
++        if not success:
++            self.failed_jobs.add(job_id)
+ 
+     def aggregate(
+         self, other: "KVConnectorWorkerMetadata"
+@@ -98,7 +102,14 @@
+         for job_id, v in other.completed_jobs.items():
+             merged[job_id] = merged.get(job_id, 0) + v
+ 
++        failed_load_blocks = {
++            job_id: set(blocks) for job_id, blocks in self.failed_load_blocks.items()
++        }
++        for job_id, blocks in other.failed_load_blocks.items():
++            failed_load_blocks.setdefault(job_id, set()).update(blocks)
+         return OffloadingWorkerMetadata(
+             completed_jobs=merged,
+             transfer_stats=self.transfer_stats.aggregate(other.transfer_stats),
++            failed_jobs=self.failed_jobs | other.failed_jobs,
++            failed_load_blocks=failed_load_blocks,
+         )
+--- a/vllm/v1/kv_offload/base.py
++++ b/vllm/v1/kv_offload/base.py
+@@ -148,6 +148,10 @@
+     keys_to_store: list[OffloadKey]
+     store_spec: LoadStoreSpec
+     evicted_keys: list[OffloadKey]
++    # Explicit policy skips, not capacity declines. Omitted keys otherwise
++    # remain retryable. Already-durable keys may also be acknowledged here;
++    # pending writes must not be acknowledged (they can still fail).
++    skipped_keys: Collection[OffloadKey] = ()
+ 
+ 
+ @dataclass
+@@ -355,6 +359,17 @@
+         """
+         return
+ 
++    def on_load_failure(
++        self, keys: Collection[OffloadKey], req_context: ReqContext
++    ) -> None:
++        """Invalidate failed objects after all ranks drain and complete_load.
++
++        Persistent managers must quarantine these keys across participants.
++        The connector also disables external lookup for the affected request,
++        so legacy managers cannot trap it in a failed-load retry loop.
++        """
++        return
++
+     def take_events(self) -> Iterable[OffloadingEvent]:
+         """
+         Take the offloading events from the manager.
+@@ -555,19 +570,47 @@
+     def submit_store(
+         self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
+     ) -> bool:
+-        """Async GPU -> offloaded medium."""
++        """Async GPU -> offloaded medium.
++
++        Returns:
++            True if transfer was submitted successfully. On False or an
++            exception, wait({job_id}) must still drain any partially issued
++            work. Register ownership before issuing copies or I/O.
++        """
+ 
+     @abstractmethod
+     def submit_load(
+         self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec
+     ) -> bool:
+-        """Async offloaded medium -> GPU."""
++        """Async offloaded medium -> GPU.
++
++        Returns:
++            True if transfer was submitted successfully. On False or an
++            exception, wait({job_id}) must still drain any partially issued
++            work. Register ownership before issuing copies or I/O.
++        """
+ 
+     @abstractmethod
+-    def get_finished(self) -> list[TransferResult]: ...
++    def get_finished(self) -> list[TransferResult]:
++        """
++        Get transfers finished since last call. Every result, including a
++        failure, certifies no further access to source/destination buffers.
++        Persistent stores report success only after durable publication.
++
++        Returns:
++            A list of TransferResults.
++        """
+ 
+     @abstractmethod
+-    def wait(self, job_ids: set[int]) -> None: ...
++    def wait(self, job_ids: set[int]) -> None:
++        """
++        Wait for all GPU, CPU and media work for these jobs to finish.
++        Unknown/unsubmitted IDs are harmless. Returning certifies no later
++        buffer access; inability to drain must raise, never return early.
++
++        Args:
++            job_ids: The set of job IDs to wait for.
++        """
+ 
+     def shutdown(self) -> None:
+         return
+--- a/vllm/v1/kv_offload/cpu/manager.py
++++ b/vllm/v1/kv_offload/cpu/manager.py
+@@ -181,19 +181,29 @@
+         keys: Collection[OffloadKey],
+         req_context: ReqContext,
+     ) -> PrepareStoreOutput | None:
++        skipped_keys: list[OffloadKey] = []
+         if self.counts is not None:
+-            num_keys = len(keys)
+             self._record_accesses(keys)
++            skipped_keys = [
++                k for k in keys if self.counts.get(k, 0) < self.store_threshold
++            ]
+             keys = [k for k in keys if self.counts.get(k, 0) >= self.store_threshold]
+-            self.stores_skipped_in_current_batch += num_keys - len(keys)
+-        # filter out chunks that are already stored
+-        keys_to_store = [k for k in keys if self._policy.get(k) is None]
++            self.stores_skipped_in_current_batch += len(skipped_keys)
++        # Pending writes may fail; only ready chunks acknowledge the frontier.
++        keys_to_store = []
++        for key in keys:
++            chunk = self._policy.get(key)
++            if chunk is None:
++                keys_to_store.append(key)
++            elif chunk.is_ready:
++                skipped_keys.append(key)
+ 
+         if not keys_to_store:
+             return PrepareStoreOutput(
+                 keys_to_store=[],
+                 store_spec=self._get_load_store_spec([], []),
+                 evicted_keys=[],
++                skipped_keys=skipped_keys,
+             )
+ 
+         self.allocation_sizes_in_current_batch.append(len(keys_to_store))
+@@ -247,6 +257,7 @@
+             keys_to_store=keys_to_store,
+             store_spec=store_spec,
+             evicted_keys=to_evict,
++            skipped_keys=skipped_keys,
+         )
+ 
+     @override

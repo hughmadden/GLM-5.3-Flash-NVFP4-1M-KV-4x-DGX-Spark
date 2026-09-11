@@ -1,0 +1,54 @@
+GLM-5.3-Flash EXL3 4bpw at TP4 with rank-local disk KV persistence
+
+Original source
+---------------
+The `persistence/recipe_persistence/` package and the campaign's own harnesses in
+`tests/`, `benchmark/` and `patches/` are licensed under the Apache License,
+Version 2.0, as indicated by their SPDX notices and headers. See LICENSE for the
+full license text. Retain the individual source-file notices.
+
+Recipe Persistence
+Copyright 2026 Hugh Madden and contributors
+
+Architectural provenance
+------------------------
+The rank-local metadata-only scheduler, held durable store completion, per-group
+unpadded memoryviews, and bounded streaming ring in `recipe_persistence` are
+adapted from the Apache-2.0 `nodelocal_disk_spec.py` source retained under
+upstream attribution gist (gist id 03f369339b709a80fd594f4083702722).
+Retained source blob: 9c365a4fa5cf42164ef9b40d9528eeb334afed49.
+The retained source declares SPDX-License-Identifier: Apache-2.0.
+
+Native interface
+----------------
+Copyright contributors to the vLLM project (Apache-2.0).
+https://github.com/vllm-project/vllm/tree/ab666069935c1f23e8ef56038b4659ac9e8f19f8
+Native OffloadingSpec/OffloadingManager/OffloadingHandler interfaces and
+CpuGpuOffloadingHandlers are imported from the installed pinned runtime; the
+runtime implementation is not vendored into this package.
+
+Ecosystem credits
+-----------------
+This deployment composes several upstream and community lineages, credited in
+README.md and docs/BASE-DECISION.md:
+
+  * upstream vLLM (Apache-2.0) at commit
+    83252ea899c6538eaa0c1fb31f28a92c661bbffc, and the vLLM GLM-5.x model port;
+  * the EXL3 engine overlay lineage (quantization kernels, fused fat-expert
+    kernels, NoPE-MLA handling for SM12x), re-anchored onto the pin above;
+  * the 4-node GB10 TP4 operational playbook (fabric layout, memory ritual,
+    unconditional page-cache flusher, launch gating discipline);
+  * the EXL3 TR3 4bpw checkpoint recipe and the DFlash2 k=7 drafter lineage;
+  * the exllamav3 project (turboderp-org) for the EXL3 runtime extension;
+  * FlashInfer, DeepGEMM, B12X and the surrounding CUDA ecosystem.
+
+Third-party material
+--------------------
+Third-party dependencies and patches retain their applicable upstream licenses
+and notices. The Apache-2.0 license for this project's original source does not
+relicense third-party material. Model and draft weights remain subject to their
+respective upstream terms and are not distributed in this package.
+
+This NOTICE preserves existing credits for informational purposes only; it does
+not modify the applicable license terms or assert additional copyright
+ownership.
