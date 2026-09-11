@@ -501,6 +501,15 @@ return hit_count if not defer_lookup else None</pre>
   </ul>
 
   <div class="note">
+    <b>Configuration note.</b> This standard bench was measured on the engine <i>before</i> the two
+    load-path fixes in 3.5 and 3.6, i.e. with <code>PERSIST_LOOKUP_KEYS_PER_STEP=8</code>. That does not
+    invalidate it — the bench salts every prompt uniquely to defeat prefix caching, so it exercises cold
+    prefill and decode rather than the reuse path those fixes affect, and all 63 requests completed with
+    zero failures and zero deferrals. It is flagged because a reader comparing this table against a run
+    on the current configuration should know the configuration changed.
+  </div>
+
+  <div class="note">
     <b>Measurement conditions, stated because they matter.</b> The bench ran for 10 min 27 s. The
     endpoint is fronted by a gateway and can receive traffic that is not ours, so the run recorded both
     an occupancy sampler and the gateway's own request log. Over the 60-minute window ending with the
@@ -614,11 +623,13 @@ GPU KV cache size: 3,407,692 tokens, Maximum concurrency for 850,000 tokens per 
     <tr><th>Attempt</th><th>Shape</th><th>Completed</th><th>Unique tokens inserted</th><th>Fraction of the 3.41M pool</th><th>Verdict</th></tr>
     <tr><td>1</td><td>128 × 32k target, C=4, 900 s budget</td><td>37 / 128</td><td>~1.68M</td><td class="bad">49%</td><td>did not reach eviction</td></tr>
     <tr><td>2</td><td>700 × 4k target, C=4, 1500 s budget</td><td>391 / 700</td><td>~2.23M</td><td class="bad">65%</td><td>did not reach eviction</td></tr>
+    <tr><td>3</td><td>800 × 4k target, C=4, 2700 s budget</td><td>674 / 800</td><td class="good">3,851,236</td><td class="good">113%</td><td class="good"><b>eviction reached</b></td></tr>
   </table>
   </div>
-  <p>Both attempts ran the full budget with zero hangs and zero deferrals, so the shortfall is purely a
-  matter of wall time, not of the engine failing. Approaching the pool needs roughly 600 of the 4k
-  sessions, and at the measured rate that is about 38 minutes of continuous fill.</p>
+  <p>The first two attempts ran their full budget with zero hangs and zero deferrals, so the shortfall was
+  purely a matter of wall time. The third was sized from that arithmetic and crossed the pool, inserting
+  <b>113% of the cache in unique tokens</b> across 674 sessions in 2,713 s. That is the condition this
+  lane existed to create: the GPU prefix cache was genuinely forced to evict.</p>
 
   <h4>What the busy-disk case does show</h4>
   <p>Even short of eviction, attempt 2 is a genuine heavy-concurrency measurement and it answers the
@@ -636,6 +647,30 @@ GPU KV cache size: 3,407,692 tokens, Maximum concurrency for 850,000 tokens per 
     <tr><td>deferrals, hangs</td><td class="good">0 / 0</td></tr>
   </table>
   </div>
+
+  <h4>Attempt 3: the same measurement with eviction actually forced</h4>
+  <div class="tablewrap">
+  <table>
+    <tr><th>Metric (attempt 3, 674 sessions at C=4, 2,713 s, 113% of the pool)</th><th>Value</th></tr>
+    <tr><td>prompt tokens per session</td><td>5,714</td></tr>
+    <tr><td>time-to-first-token, mean / max</td><td>15.96 s / 58.88 s</td></tr>
+    <tr><td>per-stream prefill</td><td>355 tok/s (C=4 contention)</td></tr>
+    <tr><td>GPU prefix cache hits / queries</td><td>59,904 / 4,099,973 &rarr; 1.5%</td></tr>
+    <tr><td>external (disk-tier) prefix cache queries</td><td class="bad">4,040,069</td></tr>
+    <tr><td>external (disk-tier) prefix cache hits</td><td class="bad">0</td></tr>
+    <tr><td>load bytes transferred from the disk tier</td><td class="bad">0</td></tr>
+    <tr><td>deferrals, hangs, timeouts</td><td class="good">0 / 0 / 4</td></tr>
+    <tr><td>refill of the first session afterwards</td><td>3.12 s (GPU cache still held it)</td></tr>
+  </table>
+  </div>
+  <p><b>Eviction pressure changes nothing.</b> With the cache under real forced eviction and
+  <b>4,040,069</b> external prefix queries issued, the tier answered <b>zero</b> of them and transferred
+  <b>zero</b> bytes. Attempt 2 with a 65% fill answered 332 of 2.3M; attempt 3 with a 113% fill answered
+  0 of 4.0M. The two are the same outcome, and the direction is if anything worse, but the honest reading
+  is that both are indistinguishable from zero at this scale.</p>
+  <p>This is the single most decisive result in the report, because it removes the last benign
+  explanation. The tier does not fail to serve because the GPU cache never gave it a chance. It is given
+  4 million chances under exactly the pressure it was designed for, and it does not serve.</p>
   <p>Read that as the operational answer to "how does the tier behave under busy concurrent sessions":
   it is consulted <b>2.33 million times</b>, answers <b>332</b> of them, and transfers <b>nothing</b>. The
   hit rate is 0.014%. The refill after the fill completed in 3.07 s against a 4.10 s cold baseline, which
@@ -645,11 +680,13 @@ GPU KV cache size: 3,407,692 tokens, Maximum concurrency for 850,000 tokens per 
   to show that the caching machinery was live and being exercised while the tier failed to contribute.</p>
 
   <div class="note">
-    <b>The honest summary of L4.</b> The tier sustains the lookup load — 2.33M queries without a hang —
-    and serves essentially none of it. Whether it would begin serving once genuine GPU eviction forces
-    the issue is <b>not yet measured</b>, because neither attempt reached the 3.41M-token pool. That is a
-    gap in this report, stated as a gap rather than papered over, and the fix is simply a longer run:
-    ~38 minutes of fill plus the refill, which is what the third attempt in flight is sized for.
+    <b>The honest summary of L4.</b> The tier sustains the lookup load — 4.04M external queries across
+    674 concurrent sessions, with zero hangs — and serves <b>none</b> of it, including under genuine
+    forced eviction at 113% of the KV pool. The eviction lane is therefore <b>complete</b>, and its answer
+    is negative and unambiguous. What it cannot tell you is <i>why</i>: section 5.3 shows by path tracing
+    that vLLM never reaches <code>prepare_load</code> at all, so the tier is never asked to serve. That
+    is where the remaining work is, and further benchmarking of this lane would add nothing until it is
+    fixed.
   </div>
 
   <h3>4.7 Context depth, for scale</h3>
@@ -1001,11 +1038,11 @@ GPU KV cache usage: 0.0%, Prefix cache hit rate: 86.6%, External prefix cache hi
       depending on prompt type, which is a wider range than any performance claim here.</li>
     <li>The published comparison figures quoted for scale come from a different hardware configuration
       and a different prompt set; they are context, not a controlled head-to-head.</li>
-    <li><b>The eviction lane did not reach GPU eviction.</b> The KV pool is 3,407,692 tokens and the
-      measured insert rate is about 1,500 tokens/s under C=4, so crossing the pool costs roughly 2,270 s
-      of continuous fill. Two attempts reached 49% and 65% of it. The report therefore demonstrates the
-      <i>busy-disk</i> case directly (2.33M tier lookups under C=4, 332 served, 0 bytes transferred) but
-      does <b>not</b> demonstrate the tier's behaviour under genuine forced eviction. Stated as a gap.</li>
+    <li><b>Eviction was reached, but only just.</b> The KV pool is 3,407,692 tokens; the successful run
+      inserted 3,851,236 unique tokens, <b>113%</b> of it, across 674 sessions and 2,713 s. That is enough
+      to force LRU eviction but not enough to characterise a steady state under sustained overflow, and
+      the fill is a single time-boxed episode rather than a soak. The negative result is solid; a
+      throughput-under-sustained-eviction curve is not measured.</li>
     <li>The disk tier's own quota is 1 TB with high/low watermarks at 900 GB and 800 GB, so its eviction
       path is not reachable by volume at test scale. What is testable is GPU-side eviction followed by a
       refill attempt, which is what section 4 exercises.</li>
