@@ -822,6 +822,42 @@ RESULT: 240.1s -&gt; TimeoutError: timed out</pre>
   hit, and why the resulting job never completes. The next step is a debug trace at that boundary, not
   further reading of the lookup path.</p>
 
+  <h4>Path tracing: the load lifecycle is never entered</h4>
+  <p>The conclusions above were reached by inference from counters. They were then tested directly by
+  adding one bounded, static-code notice at each boundary of the load lifecycle, on both the manager and
+  the worker-side transfer pump, and deploying it to all four ranks. A boundary that is never reached
+  simply never logs, which turns "where does it stop?" into a list of which boundaries were visited.</p>
+  <p>After a cold store followed by a repeat, the boundaries reached were:</p>
+  <div class="tablewrap">
+  <table>
+    <tr><th>Boundary</th><th>Meaning</th><th>Reached</th></tr>
+    <tr><td><code>lookup_disk_hit</code></td><td>the tier returned a valid all-rank lease for a chunk</td><td class="good">yes</td></tr>
+    <tr><td><code>lookup_cached_reservation</code></td><td>an already-reserved chunk was re-read</td><td class="good">yes</td></tr>
+    <tr><td><code>submit_store</code></td><td>a store was handed to the worker-side pump</td><td class="good">yes</td></tr>
+    <tr><td><code>lookup_budget_retry</code></td><td>a chunk was throttled by the per-step budget (3.5)</td><td>yes, before the fix</td></tr>
+    <tr><td><code>lookup_capacity_miss</code></td><td>the admission gate refused a chunk outright</td><td>no</td></tr>
+    <tr><td><code>prepare_load</code></td><td>vLLM asked the manager to stage a load</td><td class="bad">NO</td></tr>
+    <tr><td><code>complete_load</code></td><td>a load completed</td><td class="bad">NO</td></tr>
+    <tr><td><code>on_load_failure</code></td><td>a load failed</td><td class="bad">NO</td></tr>
+    <tr><td><code>submit_load</code></td><td>a load reached the worker-side pump</td><td class="bad">NO</td></tr>
+    <tr><td>any <code>Transfer submission refused</code> code</td><td>one of the pump's nine admission checks rejected a transfer</td><td class="bad">none</td></tr>
+  </table>
+  </div>
+  <p>Three things follow, and the third is the useful one.</p>
+  <ul>
+    <li><b>It is not the store and not the lookup.</b> The tier is reached and returns leases.</li>
+    <li><b>It is not the transfer pump.</b> The pump never refuses anything because it is never asked. The
+      nine silent <code>return False</code> paths in its admission check were a plausible suspect, and
+      they are now excluded by instrument rather than by argument — each of them was also converted into
+      a named, counted rejection so that a future refusal is visible instead of silent.</li>
+    <li><b>The stop is upstream of <code>prepare_load</code>.</b> vLLM never asks the manager to stage a
+      load at all, so <code>kv_offload_load_bytes_total</code> is zero because no load was ever prepared.
+      It is not a prepared load that stalled.</li>
+  </ul>
+  <p>That is a materially better statement than "the restore path does not fire", and it was worth the
+  instrument: three earlier hypotheses in this campaign looked convincing and were wrong, and the only
+  thing that separated them from the truth was a boundary that either logs or does not.</p>
+
   <h3>5.4 Cache-hit accounting: already correct, but invisible and genuinely missing</h3>
   <p>An initial reading of this deployment concluded that a disk-cache hit was not being counted as a
   cache hit at all. <b>That was wrong, and the correction matters.</b> vLLM does distinguish the two
@@ -953,6 +989,7 @@ GPU KV cache usage: 0.0%, Prefix cache hit rate: 86.6%, External prefix cache hi
     <tr><td>O10</td><td>The HTTP RPC client collapses distinct error causes into one class</td><td>diagnosis is harder than it needs to be</td><td>open</td></tr>
     <tr><td>O11</td><td>The local coordinator indexes <code>key[-4:]</code> without guarding short keys</td><td>a malformed key raises instead of being rejected</td><td>open</td></tr>
     <tr><td>O12</td><td>The deployed engine runs the package from a bind-mounted source overlay</td><td>the durable artifacts do not yet contain the fixes</td><td>open; requires an image rebuild</td></tr>
+    <tr><td>O13</td><td>The manager uses <code>RETRY</code> to mean "throttled, ask again"; vLLM uses it to mean "discard what I told you so far". A budget-exhausted chunk should report <code>MISS</code> and end the scan cleanly, bounding hit-rate growth instead of liveness</td><td>a throttle can destroy progress and, before the 3.6 fix, deadlock</td><td>open; deliberately not changed without its own controlled measurement, because <code>RETRY</code> is also correct for genuine lease-renewal uncertainty</td></tr>
   </table>
   </div>
 
@@ -964,6 +1001,11 @@ GPU KV cache usage: 0.0%, Prefix cache hit rate: 86.6%, External prefix cache hi
       depending on prompt type, which is a wider range than any performance claim here.</li>
     <li>The published comparison figures quoted for scale come from a different hardware configuration
       and a different prompt set; they are context, not a controlled head-to-head.</li>
+    <li><b>The eviction lane did not reach GPU eviction.</b> The KV pool is 3,407,692 tokens and the
+      measured insert rate is about 1,500 tokens/s under C=4, so crossing the pool costs roughly 2,270 s
+      of continuous fill. Two attempts reached 49% and 65% of it. The report therefore demonstrates the
+      <i>busy-disk</i> case directly (2.33M tier lookups under C=4, 332 served, 0 bytes transferred) but
+      does <b>not</b> demonstrate the tier's behaviour under genuine forced eviction. Stated as a gap.</li>
     <li>The disk tier's own quota is 1 TB with high/low watermarks at 900 GB and 800 GB, so its eviction
       path is not reachable by volume at test scale. What is testable is GPU-side eviction followed by a
       refill attempt, which is what section 4 exercises.</li>
@@ -1140,6 +1182,13 @@ sudo sqlite3 &lt;persist-root&gt;/rankN/rank-0/index.sqlite 'PRAGMA journal_mode
 
   <p>This work is a composition. Everything load-bearing came from somewhere else, and the public
   sources are named here so the result can be traced and rebuilt rather than taken on trust.</p>
+
+  <p><b>Source.</b> All configurations, patches, scripts, harnesses and findings in this report are
+  published at
+  <a href="https://github.com/hughmadden/GLM-5.3-Flash-NVFP4-1M-KV-4x-DGX-Spark">github.com/hughmadden/GLM-5.3-Flash-NVFP4-1M-KV-4x-DGX-Spark</a>,
+  which is a fork of the upstream playbook below. That fork adds one directory,
+  <code>exl3-persistence/</code>, and leaves every upstream file untouched; the two lanes can be read
+  independently.</p>
 
   <div class="tablewrap">
   <table>
