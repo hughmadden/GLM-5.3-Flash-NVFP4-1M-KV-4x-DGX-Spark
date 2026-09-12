@@ -51,7 +51,10 @@ def extract(path, name, namespace=None, *, root=None, class_name=None):
 
 
 def classes():
-    env = {"KVConnectorWorkerMetadata": object}
+    env = {"KVConnectorWorkerMetadata": object,
+           # storable_chunks ceils at finish since 0007; extracted methods
+           # resolve module helpers through this env.
+           "cdiv": lambda a, b: -(-a // b)}
     for name in ["DirectionalTransferStats", "TransferStats", "OffloadingWorkerMetadata"]:
         env[name] = extract(OFF + "common.py", name, env)
     env["TransferJobStatus"] = extract(OFF + "scheduler.py", "TransferJobStatus")
@@ -392,6 +395,108 @@ class CursorTests(unittest.TestCase):
         jobs = self.step(obj)
         self.assertEqual(next(iter(jobs.values())).src_spec.block_ids, [2, 4])
         self.assertEqual(states[0].next_stored_chunk_idx, 4)
+
+    def test_evict_only_mode_offers_nothing(self):
+        """0009 R1: under EVICT_ONLY the eager store path offers nothing,
+        ever -- a full scheduled step produces zero store batches and the
+        manager's prepare_store is never consulted."""
+        obj, _, _, offered, _ = self.state()
+        obj._evict_only = True
+        bind(obj, OFF+"scheduler.py", "_drain_eviction_queue")
+        calls = []
+        real = obj.manager.prepare_store
+        obj.manager.prepare_store = lambda keys, ctx: (calls.append(list(keys)),
+                                                       real(keys, ctx))[1]
+        self.assertEqual(self.step(obj), {})
+        self.assertEqual(offered, [])
+        self.assertEqual(calls, [])
+
+    def test_evict_sink_holds_copies_and_skips_at_cap(self):
+        """0009: the pool's eviction sink holds blocks for background
+        copies (deferred free), declines duplicates, and past the credit
+        cap declines with the skip counter -- never blocking allocation."""
+        obj, _, _, _, _ = self.state()
+        obj._evict_only = True
+        obj._held_evictions = {}
+        obj._eviction_hold_cap = 2
+        obj._eviction_skips = 0
+        # BlockHashWithGroupId is block_hash bytes + 4-byte big-endian
+        # group id (kv_cache_utils): build it directly, and bind the sink
+        # with the real leaf helpers extracted (no vllm import needed).
+        # The leaf helpers are one-liners (kv_cache_utils): key[:-4] and
+        # int.from_bytes(key[-4:], "big"); make_offload_key is manifest-
+        # listed so it extracts for real.
+        env = {
+            "get_block_hash": lambda key: key[:-4],
+            "get_group_id": lambda key: int.from_bytes(key[-4:], "big"),
+            "make_offload_key": extract(
+                "vllm/v1/kv_offload/base.py", "make_offload_key",
+                {"OffloadKey": bytes}),
+        }
+        bind(obj, OFF+"scheduler.py", "_defer_evicted_block", env)
+        held = 0
+        for i in range(4):
+            bh = bytes([9]) * 30 + (0).to_bytes(4, "big")
+            block = NS(block_hash=bh, block_id=100 + i)
+            r = obj._defer_evicted_block(block)
+            if r:
+                held += 1
+        self.assertEqual(held, 2)                    # cap respected
+        self.assertEqual(obj._eviction_skips, 2)     # two declined + counted
+        # idempotent: re-offering a held block declines without counting
+        bh = bytes([9]) * 30 + (0).to_bytes(4, "big")
+        self.assertFalse(obj._defer_evicted_block(NS(block_hash=bh, block_id=100)))
+        self.assertEqual(obj._eviction_skips, 2)
+        # eager mode: the sink never holds
+        obj._evict_only = False
+        bh = bytes([9]) * 30 + (1).to_bytes(4, "big")
+        self.assertFalse(obj._defer_evicted_block(NS(block_hash=bh, block_id=200)))
+
+    def test_drain_eviction_queue_registers_job_and_releases_declined(self):
+        """0009: the drain turns held blocks into ONE job with a properly
+        registered TransferJobStatus (the completion loop keys on it), and
+        releases blocks whose keys the manager declined."""
+        obj, _, _, _, _ = self.state()
+        obj._evict_only = True
+        k1 = bytes([2]) + (0).to_bytes(4, "big")
+        k2 = bytes([3]) + (0).to_bytes(4, "big")
+        obj._held_evictions = {
+            100: (k1, 0),
+            101: (k2, 0),
+        }
+        obj._eviction_store_per_step = 8
+        obj._eviction_job_blocks = {}
+        obj._block_pool = None
+        released = []
+        obj._jobs = {}
+        counter = {"n": 0}
+        def gen_id():
+            counter["n"] += 1
+            return counter["n"]
+        obj._generate_job_id = gen_id
+        real_prepare = obj.manager.prepare_store
+        def prepare(keys, ctx):
+            # admit the first key, decline the second (durable)
+            out = real_prepare(keys[:1], ctx)
+            out.skipped_keys = list(keys[1:])
+            return out
+        obj.manager.prepare_store = prepare
+        env = {
+            "GPULoadStoreSpec": lambda ids, **kw: NS(block_ids=ids, **kw),
+            "TransferJobStatus": extract(OFF+"scheduler.py", "TransferJobStatus"),
+            "TransferJob": extract(OFF+"common.py", "TransferJob"),
+        }
+        bind(obj, OFF+"scheduler.py", "_drain_eviction_queue", env)
+        jobs = obj._drain_eviction_queue()
+        self.assertEqual(len(jobs), 1)
+        job_id = next(iter(jobs))
+        status = obj._jobs[job_id]
+        self.assertTrue(status.is_store)
+        self.assertEqual(status.pending_count, obj.config.num_workers)
+        # the admitted block stays held; the declined one was released
+        self.assertIn(100, obj._held_evictions)
+        self.assertNotIn(101, obj._held_evictions)
+        self.assertEqual(obj._eviction_job_blocks[job_id], [100])
 
     def test_native_cpu_policy_skips_not_pending_writes(self):
         prepare = extract("vllm/v1/kv_offload/cpu/manager.py", "prepare_store", {"PrepareStoreOutput": lambda **kw: NS(**kw)})
@@ -812,6 +917,39 @@ class FinishedFrontierTests(unittest.TestCase):
         self.assertEqual(h.groups[0].next_stored_chunk_idx, 0)
         self.assertEqual([c[2] for c in h.calls if c[0] == "store"], [False, False, True])
 
+    def test_stalled_finish_drain_abandons_and_releases(self):
+        """0006: a frontier that STOPS PROGRESSING (persistent manager
+        declines, rows null past finish) must not hold the finished request --
+        and the client response gated on the terminal finished_sending
+        signal -- forever. Steps that advance the frontier reset the stall
+        counter, so slow-but-progressing drains are never cut."""
+        h = self.harness(24, lambda keys, n: (keys[:8], []))
+        first = h.obj._build_store_jobs(NS(num_scheduled_tokens={"r": 1536}, finished_req_ids=()))
+        self.finish(h)
+        self.complete(h, first)
+        self.assertEqual(h.groups[0].next_stored_chunk_idx, 8)
+        # The manager now declines everything: no admissions and no skips is
+        # retryable, so the frontier can never complete on its own.
+        h.obj.manager.prepare_store = lambda keys, ctx: NS(
+            keys_to_store=[], skipped_keys=[], store_spec=None)
+        warnings = []
+        previous = LOG.warning
+        LOG.warning = lambda message, *a: warnings.append(message % a)
+        self.addCleanup(setattr, LOG, "warning", previous)
+        for _ in range(70):
+            if not h.state.finish_store_abandoned:
+                self.step(h)
+        self.assertTrue(h.state.finish_store_abandoned)
+        self.assertTrue(any("stalled" in w for w in warnings))
+        self.assertFalse(self.step(h))
+        # Abandoning must actually release: the terminal finished_sending
+        # signal fires through update_connector_output (driven here by a
+        # completion round, even an empty one).
+        self.assertIn("r", h.obj._req_status)
+        self.complete(h, {})
+        self.assertNotIn("r", h.obj._req_status)
+        self.assertFalse(h.obj.has_pending_push_work())
+
     def test_failure_retry_budget_is_per_key_not_per_job_or_pressure(self):
         h = self.harness(16, lambda keys, n: (keys[:8], []))
         first = h.obj._build_store_jobs(NS(num_scheduled_tokens={"r": 1024}, finished_req_ids=()))
@@ -892,6 +1030,25 @@ class FinishedFrontierTests(unittest.TestCase):
         self.assertEqual(h.freed, ["r"])
         self.assertEqual(h.calls, [("load",), ("finish", "ctx")])
 
+    def test_finished_partial_chunk_counts_at_finish(self):
+        """0007: the final partial chunk is stable at finish and must be
+        storable. With 24 chunks keyed/allocated and 23.84 chunks
+        offloadable, the floor stopped the frontier at 23 -- one short of
+        the full-prompt boundary a same-prompt repeat resumes at."""
+        h = self.harness(24, lambda keys, n: (list(keys), []))
+        h.req.num_tokens = 24 * 64 - 10
+        h.req.num_prompt_tokens = 24 * 64 - 10
+        first = h.obj._build_store_jobs(NS(num_scheduled_tokens={"r": h.req.num_tokens}, finished_req_ids=()))
+        self.finish(h)
+        self.complete(h, first)
+        while h.obj._req_status:
+            jobs = self.step(h)
+            self.complete(h, jobs)
+            if h.state.finish_store_abandoned:
+                break
+        self.assertEqual(h.groups[0].next_stored_chunk_idx, 24)
+        self.assertFalse(h.state.finish_store_abandoned)
+
     def test_finished_frontier_retains_prompt_cap_and_eagle_tail(self):
         h = self.harness(24, lambda keys, n: (None, []))
         h.obj.config.offload_prompt_only = True
@@ -925,6 +1082,20 @@ class FinishedFrontierTests(unittest.TestCase):
 
 
 class PackagingTests(unittest.TestCase):
+    def test_series_patches_never_rename_or_drop_module_classes(self):
+        """Regression guard (2026-09-12): a generated patch once carried a
+        class-rename hunk (-class A / +class B) from a contaminated build
+        tree. apply.py validated it against the same contaminated tree, the
+        AST suite passed (it binds methods, not the class), and the live
+        engine died on ImportError. No series patch may add or remove a
+        top-level class/def line."""
+        root = Path(patcher.__file__).parent
+        for entry in patcher.manifest()["patches"]:
+            text = (root / entry["file"]).read_text()
+            for line in text.splitlines():
+                if line.startswith(("+class ", "-class ", "+    class ", "-    class ")):
+                    self.fail(f"{entry['file']}: class-rename hunk: {line!r}")
+
     def test_pristine_reproduction_and_apply_verify_reverse(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

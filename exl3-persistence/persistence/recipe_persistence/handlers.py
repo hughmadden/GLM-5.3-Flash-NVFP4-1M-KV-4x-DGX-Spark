@@ -13,6 +13,7 @@ OffloadingWorker API since vLLM f237e16b41 (#45053). It is no longer inferred
 from LoadStoreSpec.medium(), which upstream deleted in c46ced1ee3 (#46544).
 """
 import logging
+import os
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 from dataclasses import dataclass
@@ -22,26 +23,6 @@ import time
 from .geometry import key_group
 
 _LOG = logging.getLogger(__name__)
-
-# One-shot path tracing for transfer submission. A load that is never submitted
-# at all looks identical, from the engine's counters, to a load that was
-# submitted and never finished; these notices separate the two. Static codes
-# only -- no key, path, token or exception message is logged.
-_NOTE_SEEN: set[str] = set()
-_NOTE_COUNTS: dict[str, int] = {}
-
-
-def _note(code: str) -> None:
-    _NOTE_COUNTS[code] = _NOTE_COUNTS.get(code, 0) + 1
-    if code not in _NOTE_SEEN:
-        _NOTE_SEEN.add(code)
-        _LOG.warning("Persistence trace: %s", code)
-
-
-def note_counts() -> dict[str, int]:
-    """Snapshot of submitted transfer kinds (diagnostics only)."""
-    return dict(_NOTE_COUNTS)
-
 
 class _CloseOnce:
     """One acknowledged cleanup; retain ownership/callback on unproved drain.
@@ -80,30 +61,61 @@ class _CloseOnce:
 
 
 
-_REJECT_SEEN: set[str] = set()
-_REJECT_COUNTS: dict[str, int] = {}
+def _emit_trace(message: str, *args) -> None:
+    """See native._emit_trace: WARNING when PERSIST_DEBUG_TRACE is set, else INFO."""
+    if os.environ.get("PERSIST_DEBUG_TRACE", "").strip().lower() not in (
+            "", "0", "false", "no"):
+        _LOG.warning(message, *args)
+    else:
+        _LOG.info(message, *args)
 
 
-def _reject(code: str) -> bool:
-    """Record why a transfer submission was refused, and return False.
+class _TransferTrace:
+    """Per-pump one-shot transfer diagnostics.
 
-    ``_submit`` has several independent admission checks and used to return a
-    bare ``False`` from each. A refused load then simply never completed, with
-    nothing anywhere saying which check had refused it, which made a silent
-    stall indistinguishable from a slow transfer. The codes are static and
-    bounded, matching the package rule that no key, path, token or exception
-    message ever reaches a log line.
+    One-shot flags are per pump, not module-global, so a long-lived or repeated
+    pump still reports its own first occurrence and instances cannot suppress
+    each other's diagnostics.
+
+    ``refused`` stays at WARNING: a refused transfer is a real fault. Note
+    traces are INFO, because they fire on the healthy path.
     """
-    _REJECT_COUNTS[code] = _REJECT_COUNTS.get(code, 0) + 1
-    if code not in _REJECT_SEEN:
-        _REJECT_SEEN.add(code)
-        _LOG.warning("Transfer submission refused: %s", code)
-    return False
 
+    __slots__ = ("refused_seen", "refused", "noted_seen", "noted")
 
-def reject_counts() -> dict[str, int]:
-    """Snapshot of refusal codes seen by this process (diagnostics only)."""
-    return dict(_REJECT_COUNTS)
+    def __init__(self):
+        self.refused_seen: set[str] = set()
+        self.refused: dict[str, int] = {}
+        self.noted_seen: set[str] = set()
+        self.noted: dict[str, int] = {}
+
+    def reject(self, code: str) -> bool:
+        """Record why a transfer submission was refused, and return False.
+
+        ``_submit`` has several independent admission checks and used to return
+        a bare ``False`` from each. A refused load then simply never completed,
+        with nothing anywhere saying which check had refused it, which made a
+        silent stall indistinguishable from a slow transfer. Codes are static
+        and bounded, matching the package rule that no key, path, token or
+        exception message ever reaches a log line.
+        """
+        self.refused[code] = self.refused.get(code, 0) + 1
+        if code not in self.refused_seen:
+            self.refused_seen.add(code)
+            _LOG.warning("Transfer submission refused: %s", code)
+        return False
+
+    def note(self, code: str) -> None:
+        self.noted[code] = self.noted.get(code, 0) + 1
+        if code not in self.noted_seen:
+            self.noted_seen.add(code)
+            _emit_trace("Persistence trace: %s", code)
+
+    def reject_counts(self) -> dict[str, int]:
+        return dict(self.refused)
+
+    def note_counts(self) -> dict[str, int]:
+        return dict(self.noted)
 
 
 @dataclass(frozen=True)
@@ -137,6 +149,7 @@ class _Job:
     size: int = 0
     started: float = 0.0
     credit: int = 0
+    disk_retries: int = 0
 
 
 class DiskTransferPump:
@@ -167,6 +180,7 @@ class DiskTransferPump:
         self.cpu_tensors = self._store_native.dst_tensors
         self.free = deque(range(rows))
         self.jobs = {}
+        self._trace = _TransferTrace()
         self.ready = deque()
         self.finished = []
         self.native_jobs = {}
@@ -181,46 +195,46 @@ class DiskTransferPump:
 
     def submit_store(self, job_id, src_spec, dst_spec):
         """Async GPU -> node-local disk."""
-        _note("submit_store")
+        self._trace.note("submit_store")
         return self._submit(job_id, src_spec, dst_spec, True)
 
     def submit_load(self, job_id, src_spec, dst_spec):
         """Async node-local disk -> GPU."""
-        _note("submit_load")
+        self._trace.note("submit_load")
         return self._submit(job_id, src_spec, dst_spec, False)
 
     def _submit(self, job_id, src_spec, dst_spec, storing):
         if self.closed or job_id in self.jobs:
-            return _reject("closed_or_duplicate")
+            return self._trace.reject("closed_or_duplicate")
         gpu, disk = (src_spec, dst_spec) if storing else (dst_spec, src_spec)
         try:
             if not isinstance(gpu, self.gpu_cls) or not isinstance(disk, DiskLoadStoreSpec):
-                return _reject("spec_type")
+                return self._trace.reject("spec_type")
             n = len(disk.keys)
             if n < 1 or n != len(gpu.block_ids) or n != len(disk.tokens):
-                return _reject("arity_keys_vs_blocks")
+                return self._trace.reject("arity_keys_vs_blocks")
             if self.pending_keys + len(self.finished) + n > self.max_pending_keys:
-                return _reject("pending_capacity")
+                return self._trace.reject("pending_capacity")
             groups = tuple(key_group(k, len(self.geometry.group_refs)) for k in disk.keys)
             expected = tuple(g for g, count in enumerate(gpu.group_sizes) for _ in range(count))
             if (groups != expected or len(gpu.group_sizes) != len(self.geometry.group_refs)
                     or len(gpu.block_indices) != len(gpu.group_sizes)):
-                return _reject("group_shape")
+                return self._trace.reject("group_shape")
             if (not isinstance(disk.namespace, str) or not disk.namespace
                     or not isinstance(disk.owner, str) or not disk.owner):
-                return _reject("identity")
+                return self._trace.reject("identity")
             if any(self.rank >= len(tokens) or not isinstance(tokens[self.rank], str)
                    or not tokens[self.rank] for tokens in disk.tokens):
-                return _reject("rank_token")
+                return self._trace.reject("rank_token")
             gpu_tensors = self._store_native.src_tensors
             for block, group in zip(gpu.block_ids, groups):
                 if int(block) != block or int(block) < 0:
-                    return _reject("block_value")
+                    return self._trace.reject("block_value")
                 if any(int(block) >= gpu_tensors[index].shape[0]
                        for index, _ in self.geometry.group_refs[group]):
-                    return _reject("block_bounds")
+                    return self._trace.reject("block_bounds")
         except (ValueError, TypeError, AttributeError, IndexError):
-            return _reject("exception")
+            return self._trace.reject("exception")
         job = _Job(job_id, disk, gpu, storing, groups, started=time.monotonic(), credit=self.quantum)
         self.jobs[job_id] = job
         self.pending_keys += n
@@ -323,6 +337,19 @@ class DiskTransferPump:
                 job.future = None
                 if success and not job.store and not job.cancelled:
                     self._submit_native(job)
+                elif (not success and not job.store and not job.cancelled
+                        and job.disk_retries < 1):
+                    # Transient read failure (a brief store lock, an NVMe
+                    # hiccup): re-read the same row once before failing the
+                    # job. DiskStore.read_into returns False identically for
+                    # transients and corruption, but corruption retires the
+                    # object, so a genuine corrupt read fails again here and
+                    # the job still fails -- while a transient is absorbed
+                    # and the whole-job invalidation never fires (review
+                    # section 2.1: one bad read must not veto every key of
+                    # a healthy restored prefix).
+                    job.disk_retries += 1
+                    self._submit_disk(job)
                 else:
                     self._row_done(job, success)
         while self.free and self.ready:

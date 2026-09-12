@@ -16,6 +16,26 @@
     {
       "file": "0004-finished-store-frontier.patch",
       "sha256": "63dc7935020c4c4264d338babe1b926aa771bcb9ec1a44937a378658240322a5"
+    },
+    {
+      "file": "0005-store-frontier-pending-keys.patch",
+      "sha256": "b1edc591c0cc83c0e788fb741a3a919aa36e4be3aa5c30ea95dbcf4af9caf9c0"
+    },
+    {
+      "file": "0006-finish-drain-liveness-bound.patch",
+      "sha256": "de74be2054259dbd482852e2671fe8837e1fdf97a752a7bc66afae4dd031bf1e"
+    },
+    {
+      "file": "0007-finish-partial-chunk.patch",
+      "sha256": "3c637af29f3501ffa218738df878f75799f1c103fa87c8cbe9a3e73fbeb61ad8"
+    },
+    {
+      "file": "0008-noncacheable-groups-excluded.patch",
+      "sha256": "26eb1eeae501fe95af0889f2d9e429d97cf98249d783e820542b729e8258e3ee"
+    },
+    {
+      "file": "0009-writebehind-evict-only.patch",
+      "sha256": "a825d4b3d28ba358cfcfb75685108822b22b7c68b7c5f0a263a605fee1babd6e"
     }
   ],
   "files": {
@@ -28,7 +48,7 @@
     },
     "vllm/v1/kv_offload/base.py": {
       "before": "ea648adaa4c8b960623c75de4c483539c16a2da2d911ab4c666feca3dd52474b",
-      "after": "777f39753bb7e252b251afbcee859dcd2625d6044124ca54e203c4532c93a8dc",
+      "after": "4fbc6578daf118ad5eec7ffa63838ec882ce1d0df2d1fc32edcedf6e003581ba",
       "anchors": [
         "class ReqContext:"
       ]
@@ -49,14 +69,14 @@
     },
     "vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py": {
       "before": "f6b4bbde339e4ffa0507392c22af66c5f0ca8266f0980ff2965cd5eeaab525f2",
-      "after": "75b8cadb44b5d7404974921ebab7a2f0fe9cf4c9529b45fd539ecc88a0ad9545",
+      "after": "c61b875a11d4b510255a25f8a489eecb84601c01022cb41bd1303fbfc56bfd2a",
       "anchors": [
         "class TransferJobStatus:"
       ]
     },
     "vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py": {
       "before": "06bdf20e17d63a683c9a5e1e9c86cb4c530e1312c7e4731713e2bb7e025ef802",
-      "after": "6fb06a0cf74c01ec2446c8d0bbd5630d3aec25416aceed5adba0261940b41b25",
+      "after": "c5325dc2e6487be12b1c7e0318b180fad19bf8df61f99d5544e73bde6048d528",
       "anchors": [
         "class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):"
       ]
@@ -66,6 +86,13 @@
       "after": "1cfcfa7095455c56292cb4914843002a9cbb52722bf73f0455de330ed8b24d20",
       "anchors": [
         "class Scheduler(SchedulerInterface):"
+      ]
+    },
+    "vllm/v1/core/block_pool.py": {
+      "before": "709b67ebcd2ee393654c3a875f8ecb360b22bcd10f43503be078e692dd38fc20",
+      "after": "de2170d56511e49c204326e3e2d25aca323e4fb021e0c7a3f923eb8c858ef193",
+      "anchors": [
+        "class BlockPool:"
       ]
     }
   }

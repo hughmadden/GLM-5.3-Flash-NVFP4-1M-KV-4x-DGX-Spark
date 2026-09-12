@@ -575,7 +575,11 @@ def test_async_renewal_uses_finite_non_io_proof_and_defers_until_ack():
         metadata_steps_until(m, lambda: not m._renew_requested)
         assert m.lookup(key(), ctx) is True
         proof[0] = time.monotonic() - 1
-        assert m.lookup(key(), ctx) is None  # Never use a previous True forever.
+        # A provably expired lease cannot be renewed back to life: it gets a
+        # clean miss and the reservation is released for re-reservation. The
+        # never-cache-True property this line guards is preserved (the answer
+        # is False); unproven-but-renewable leases still defer above.
+        assert m.lookup(key(), ctx) is False
     finally:
         gate.set()
         m.on_request_finished(ctx)
@@ -1547,6 +1551,51 @@ def test_cached_lookup_expired_lease_is_not_readvertised():
     c.renew = lambda ticket: False
     assert m.lookup(key(), ctx) is False
     assert not m.loads and not c.live
+
+
+def test_transient_read_failure_is_retried_once_then_succeeds():
+    """Review section 2.1: DiskStore.read_into returns False identically for
+    transient hiccups and corruption. A transient must be re-read once and
+    absorbed -- the job succeeds and the whole-job invalidation (which
+    vetoes every key of a healthy restored prefix) never fires."""
+    p, native, store, trace, _ = pump()
+    try:
+        store.payload["t0"] = b"a" * 28
+        attempts = {"n": 0}
+        real = store.read_into
+        def flaky(token, buffers):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                return False
+            return real(token, buffers)
+        store.read_into = flaky
+        assert transfer(p, 1, (disk([key()]), GPU([9], [1, 0], [0, 0])))
+        p.wait({1})
+        result = p.get_finished()
+        assert result[0].success
+        assert attempts["n"] == 2  # one transient failure + one success
+    finally:
+        p.shutdown()
+
+
+def test_persistent_read_failure_fails_after_exactly_one_retry():
+    """The retry bound is real: a read that keeps failing (corrupt or
+    unrecoverable) must not loop -- it fails the job after exactly one
+    re-read, preserving the existing fail-closed semantics."""
+    p, native, store, trace, _ = pump()
+    try:
+        attempts = {"n": 0}
+        def always_fails(token, buffers):
+            attempts["n"] += 1
+            return False
+        store.read_into = always_fails
+        assert transfer(p, 1, (disk([key()]), GPU([9], [1, 0], [0, 0])))
+        p.wait({1})
+        result = p.get_finished()
+        assert not result[0].success
+        assert attempts["n"] == 2  # initial attempt + exactly one retry
+    finally:
+        p.shutdown()
 
 
 def test_load_holds_row_until_gpu_completion():

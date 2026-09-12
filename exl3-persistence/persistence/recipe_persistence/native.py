@@ -14,8 +14,11 @@ factory contract is defined in coordinator.Provider. It must perform an explicit
 bounded all-rank canonical registration handshake and publish a SHA256
 layout_fingerprint over the ordered all-rank padded pages and group refs. There
 is no local-only TP fallback or payload sizing from representative layer specs.
-lookup_keys_per_step defaults to 8: fresh scheduler reservations yield via None
-at the step budget, round-robin by request owner. Cached scans are not charged.
+lookup_keys_per_step is REQUIRED (the old default of 8 hung every
+restore past ~900 tokens -- FIX-LOOKUP-BUDGET-20260911); fresh reservations
+yield via None at the step budget, round-robin by request owner. Cached
+scans are not charged. min_disk_lookup_tokens (default 4096) is the R3
+read gate: smaller requests never consult the disk tier.
 Production metadata cleanup uses metadata_workers=2, metadata_max_submitted=8,
 and metadata_shutdown_timeout=10 seconds. Tickets stay owned until background
 callbacks return an actual ACK and the scheduler polls it. The coordinator must
@@ -43,20 +46,75 @@ _LOG = logging.getLogger(__name__)
 # worker-side pump. These one-shot notices say which of those boundaries is
 # actually reached. Codes are static; no key, path, token or exception message
 # is ever logged.
-_TRACE_SEEN: set[str] = set()
-_TRACE_COUNTS: dict[str, int] = {}
+def _trace_enabled() -> bool:
+    """Opt-in path tracing.
+
+    Diagnostics must be visible in an engine container, whose effective level
+    drops this module's INFO records, without polluting the WARNING stream that
+    the test suite asserts on and that is reserved for genuine degradation.
+
+    So the level is the switch: with PERSIST_DEBUG_TRACE set the traces are
+    WARNING (visible at the engine's default level); unset they are INFO
+    (invisible in production, harmless in tests). Default off.
+    """
+    return os.environ.get("PERSIST_DEBUG_TRACE", "").strip().lower() not in (
+        "", "0", "false", "no")
 
 
-def _trace(code: str, detail: str = "") -> None:
-    _TRACE_COUNTS[code] = _TRACE_COUNTS.get(code, 0) + 1
-    if code not in _TRACE_SEEN:
-        _TRACE_SEEN.add(code)
-        _LOG.warning("Persistence trace: %s%s", code, (" " + detail) if detail else "")
+def _enable_offload_scheduler_debug() -> None:
+    """Raise vLLM's offloading scheduler to DEBUG when tracing is on.
+
+    The connector's ``_lookup_complete_chunks`` can return 0 even when the
+    backend found chunks, and which of its several ``return 0`` paths fired is
+    only visible in its own debug output -- specifically the line
+    "Request %s hit %s offloaded tokens after %s GPU hit tokens". Enabling that
+    one logger avoids whole-process DEBUG logging, which on this engine is
+    unusably verbose.
+    """
+    if not _trace_enabled():
+        return
+    for name in (
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler",
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading",
+    ):
+        logging.getLogger(name).setLevel(logging.DEBUG)
 
 
-def trace_counts() -> dict[str, int]:
-    """Snapshot of reached load-path boundaries (diagnostics only)."""
-    return dict(_TRACE_COUNTS)
+def _emit_trace(message: str, *args) -> None:
+    if _trace_enabled():
+        _LOG.warning(message, *args)
+    else:
+        _LOG.info(message, *args)
+
+
+class _TraceState:
+    """Per-manager one-shot path tracing.
+
+    Deliberately *not* module-global. A process-global "have I logged this
+    code yet" flag means only the first manager ever logs, which makes the
+    traces sparse in exactly the long-lived engine runs they exist for, and it
+    leaks state between instances so one manager's activity suppresses
+    another's diagnostics. Both are bugs in a diagnostic.
+
+    The log level is INFO, not WARNING: the WARNING stream is reserved for the
+    static degradation reasons the test suite asserts on.
+    """
+
+    __slots__ = ("seen", "counts")
+
+    def __init__(self):
+        self.seen: set[str] = set()
+        self.counts: dict[str, int] = {}
+
+    def note(self, code: str, detail: str = "") -> None:
+        self.counts[code] = self.counts.get(code, 0) + 1
+        if code not in self.seen:
+            self.seen.add(code)
+            _emit_trace("Persistence trace: %s%s", code,
+                        (" " + detail) if detail else "")
+
+    def counts_snapshot(self) -> dict[str, int]:
+        return dict(self.counts)
 
 # Disk-tier lookup observability. The names are upstream vLLM's documented
 # tiering metric names (vllm/v1/kv_offload/tiering/base.py
@@ -76,6 +134,29 @@ class _Manager:
     # that a deferred request is re-admitted promptly, long enough that one
     # owner still gets its whole per-step key budget in a single scan.
     _LOOKUP_TURN_SECONDS = 0.05
+    # How many times one lookup may answer RETRY for a reservation whose
+    # lease cannot be vouched for. Past this (or immediately, when the lease
+    # is provably expired and renew cannot resurrect it) the reservation is
+    # released and the chunk answers a clean MISS: vLLM's scan terminates and
+    # the caller acts on the prefix it did find. An unbounded RETRY is a
+    # livelock -- prepare_load is never reached, so the reservation is never
+    # released, so every later lookup defers again (BUG-LOAD-PATH-STALE-LEASE).
+    _STALE_LEASE_MAX_RETRY = 4
+    # How many times an un-ACKed background cleanup (release/complete_store/
+    # invalidate) is resubmitted before the sustained rejection becomes
+    # evidence and the tier fails closed. A single transient RPC failure must
+    # not disable the tier; an unbounded retry must not hide a dead one.
+    _METADATA_MAX_ATTEMPTS = 6
+    # Wall-clock bound for processing metadata ACKs outside on_schedule_end.
+    # The scheduler hook normally drives _poll_metadata, but a request deferred
+    # BY this manager leaves the engine with no batch -- and then the hook
+    # never runs. That is the lookup-gate deadlock one level down: the gate was
+    # made wall-clock driven, the ACK pump was not. Every manager entry point
+    # the scheduler can reach while idle polls when due, so renewal/release ACK
+    # processing, has_pending_work() and the invalidation safe-reset cannot be
+    # held hostage by a stalled engine. Single-writer by construction: only
+    # the scheduler thread calls manager methods.
+    _METADATA_POLL_INTERVAL = 0.05
 
     def __init__(self, coordinator, namespace, size_by_group, max_pending_keys,
                  disk_spec_cls, output_cls, context_cls, close_provider=None,
@@ -101,6 +182,8 @@ class _Manager:
         self.lookup_keys_per_step = lookup_keys_per_step
         self._lookup_keys_left = lookup_keys_per_step
         self._lookup_turn_started = None
+        self._trace_state = _TraceState()
+        self._outcome = {"hit": 0, "miss": 0, "retry": 0}
         self._lookup_owners = {}  # Ordered, bounded by manager capacity.
         self._lookup_turn_owner = None
         self._store_keys_left = lookup_keys_per_step
@@ -121,6 +204,7 @@ class _Manager:
         self._metadata_timeout = float(metadata_shutdown_timeout)
         self._metadata_futures = {}
         self._metadata_retry = {}
+        self._metadata_attempts = {}
         self._metadata_turn = 0
         self._metadata_stopping = False
         self._retiring_loads = {}  # FIFO intent order; new completions cannot jump older work.
@@ -128,14 +212,20 @@ class _Manager:
         self._invalidations = {}  # key -> acknowledged; veto persists until safe reset.
         self._namespace_quarantined = False  # Unrecordable failure: explicit fail-stop.
         self._renew_requested = {}
+        self._stale_retries = {}  # identity -> consecutive stale-lease RETRYs; bounded.
         self._reset_veto_requested = False
         self._metadata_executor = (ThreadPoolExecutor(max_workers=metadata_workers,
                                   thread_name_prefix="kv-metadata") if metadata_workers else None)
+        self._last_metadata_poll = time.monotonic()
         # Disk-tier lookup observability (monotonic totals, read+reset by
         # take_tier_stats). Never read by admission, eviction or the lookup
         # decision itself: counters only.
         self.tier_chunk_queries = 0
         self.tier_chunk_hits = 0
+        # Why-did-the-lookup-answer-miss reasons (diagnostics only, static
+        # codes). The outcome sampler says WHAT was answered; this says WHY,
+        # separating vetoes, capacity, gate and coordinator-level refusals.
+        self._lookup_reasons = {}
 
     @staticmethod
     def _invoke_metadata(callback, args, renewal):
@@ -146,24 +236,83 @@ class _Manager:
         except Exception:
             return False
 
-    def _lease_valid(self, ticket):
+    def _lease_deadline(self, ticket):
+        """Non-I/O monotonic deadline snapshot; None when unvouchable."""
         try:
             deadline = self.coordinator.lease_deadline(ticket)  # Contract: no I/O.
-            if type(deadline) not in (int, float) or not math.isfinite(deadline):
-                return False
-            remaining = deadline - time.monotonic()
-            if remaining <= min(30.0, self._metadata_timeout):
-                self._renew_requested[ticket.token] = ticket
-            return remaining > 0
         except Exception:
             self._degrade("coordinator_callback_failed")
+            return None
+        if type(deadline) not in (int, float) or not math.isfinite(deadline):
+            return None
+        return deadline
+
+    def _lease_valid(self, ticket):
+        deadline = self._lease_deadline(ticket)
+        if deadline is None:
             return False
+        remaining = deadline - time.monotonic()
+        if remaining <= min(30.0, self._metadata_timeout):
+            self._renew_requested[ticket.token] = ticket
+        return remaining > 0
+
+    def _release_stale_reservation(self, identity, ticket):
+        """Drop a reservation whose lease cannot be vouched for.
+
+        Ownership is never discarded unacknowledged: async mode retires the
+        identity and lets the background worker release the lease; sync mode
+        releases inline. The data stays on disk -- a later lookup (or the
+        same scan, via the "reserve" outcome) re-reserves it.
+        """
+        self._stale_retries.pop(identity, None)
+        self._renew_requested.pop(ticket.token, None)
+        if self._async_metadata:
+            self._retiring_loads.setdefault(identity, None)
+            self._dispatch_metadata()
+        elif identity not in self.prepared:
+            self._notify("release", ticket)
+            self.loads.pop(identity, None)
+
+    def _stale_lease_lookup(self, identity, ticket):
+        """Decide the honest answer for an un-vouchable reservation.
+
+        Returns "reserve" when the lease is provably expired (a past deadline
+        renew cannot resurrect -- storage renew requires unexpired leases):
+        drop it and let the caller make a fresh reservation in the same scan.
+        Returns "miss" when bounded retries are exhausted or the manager is
+        closed: drop it and terminate the scan cleanly. Returns "retry" only
+        for genuine renewal uncertainty, where another pass can plausibly
+        help, and only while the bound lasts.
+        """
+        deadline = self._lease_deadline(ticket)
+        expired = deadline is not None and time.monotonic() >= deadline
+        retries = self._stale_retries.get(identity, 0) + 1
+        self._stale_retries[identity] = retries
+        if expired:
+            self._note_lookup_reason("stale_expired")
+            self._trace("lookup_stale_lease_released")
+            self._release_stale_reservation(identity, ticket)
+            return "miss" if self.closed else "reserve"
+        if self.closed or retries > self._STALE_LEASE_MAX_RETRY:
+            self._note_lookup_reason("stale_bounded")
+            self._trace("lookup_stale_lease_released")
+            self._release_stale_reservation(identity, ticket)
+            return "miss"
+        self._renew_requested[ticket.token] = ticket
+        self._dispatch_metadata()
+        return "retry"
 
     def _metadata_pending(self):
         return bool(self._namespace_quarantined or self._metadata_futures or self._retiring_loads or self._retiring_stores
                     or self._renew_requested or any(not ack for ack in self._invalidations.values()))
 
+    def _poll_metadata_if_due(self):
+        if (self._async_metadata and not self._shutdown_complete
+                and time.monotonic() - self._last_metadata_poll >= self._METADATA_POLL_INTERVAL):
+            self._poll_metadata()
+
     def _poll_metadata(self):
+        self._last_metadata_poll = time.monotonic()
         for future, work in list(self._metadata_futures.items()):
             if not future.done():
                 continue
@@ -175,15 +324,31 @@ class _Manager:
             del self._metadata_futures[future]
             work_id = (kind, identity)
             if not acknowledged:
-                self._degrade("lease_renewal_lost" if kind == "renew" else "coordinator_callback_rejected")
                 if kind == "renew":
+                    # A lost renewal is expected under renewal lag -- the lease
+                    # may simply have expired before the renew landed, and
+                    # renew of an expired lease cannot succeed. Retire the
+                    # affected reservations so lookups re-reserve; this is not
+                    # evidence against data safety and must not disable the
+                    # tier. (Sustained failure surfaces through the releases
+                    # that follow, which are retried and escalate below.)
                     self._renew_requested.pop(identity, None)
                     for owner_key, held in self.loads.items():
                         if held.token == identity:
                             self._retiring_loads.setdefault(owner_key, None)
+                    continue
+                attempts = self._metadata_attempts.get(work_id, 0) + 1
+                self._metadata_attempts[work_id] = attempts
+                if attempts > self._METADATA_MAX_ATTEMPTS:
+                    # Sustained rejection: bounded retries did not absorb it.
+                    # Now it is evidence of coordinator trouble and the tier
+                    # fails closed -- one transient RPC must not kill it, an
+                    # unbounded retry must not hide a dead one.
+                    self._degrade("coordinator_callback_rejected")
                 else:
                     self._metadata_retry[work_id] = time.monotonic() + 0.05
                 continue
+            self._metadata_attempts.pop(work_id, None)
             self._metadata_retry.pop(work_id, None)
             if kind == "load":
                 if self.loads.get(identity) is ticket:
@@ -305,6 +470,13 @@ class _Manager:
         # Keep the current turn marker until schedule end: completing/missing
         # midway through a step must not grant a second owner's fresh quantum.
 
+    def _trace(self, code: str, detail: str = "") -> None:
+        """Record a reached load-path boundary (per-instance, diagnostics only)."""
+        self._trace_state.note(code, detail)
+
+    def trace_counts(self) -> dict[str, int]:
+        return self._trace_state.counts_snapshot()
+
     def _rotate_lookup_turn(self):
         owner = self._lookup_turn_owner
         if owner in self._lookup_owners:
@@ -393,34 +565,80 @@ class _Manager:
             self._degrade("coordinator_callback_failed")
             return False
 
+    def _count_outcome(self, result) -> None:
+        """Bounded outcome sampling for the load-path investigation.
+
+        vLLM's scan breaks on the first MISS and discards everything on a RETRY
+        without breaking, so which of those the backend returns for the *first*
+        chunk decides whether prepare_load is ever reached. A few samples of the
+        running totals make that visible from the engine log.
+        """
+        kind = "hit" if result is True else ("retry" if result is None else "miss")
+        self._outcome[kind] += 1
+        if self._outcome[kind] <= 3:
+            _emit_trace("lookup outcome %s (#%d): hit=%d miss=%d retry=%d",
+                        kind, self._outcome[kind], self._outcome["hit"],
+                        self._outcome["miss"], self._outcome["retry"])
+
+    def _note_lookup_reason(self, code):
+        """Bounded why-was-it-a-miss sampling (diagnostics only, static codes)."""
+        reasons = self._lookup_reasons
+        reasons[code] = reasons.get(code, 0) + 1
+        if reasons[code] <= 3:
+            _emit_trace("lookup reason %s (#%d): %s",
+                        code, reasons[code], sorted(reasons.items()))
+
     def lookup(self, key, req_context) -> bool | None:
+        self._poll_metadata_if_due()
+        result = self._lookup_impl(key, req_context)
+        self._count_outcome(result)
+        return result
+
+    def _lookup_impl(self, key, req_context) -> bool | None:
         if not self.can_store():
             return False
         identity = self._identity(key, req_context)
-        if key in self._invalidations or identity in self._retiring_loads:
+        if key in self._invalidations:
+            self._note_lookup_reason("veto_invalidated")
+            return False
+        if identity in self._retiring_loads:
+            self._note_lookup_reason("veto_retiring")
             return False
         if identity in self.loads:
-            _trace("lookup_cached_reservation")
+            self._trace("lookup_cached_reservation")
             ticket = self.loads[identity]
             if self._async_metadata:
                 if self._lease_valid(ticket):
                     return True
-                self._renew_requested[ticket.token] = ticket
-                self._dispatch_metadata()
-                return None if not self.closed else False
-            if getattr(self.coordinator, "renew", None) is not None:
-                if not self._notify("renew", ticket):
-                    if identity not in self.prepared:
-                        self._notify("release", ticket)
-                        self.loads.pop(identity)
+                # RETRY on an already-reserved chunk whose lease we cannot
+                # vouch for is bounded: see _stale_lease_lookup. An expired
+                # lease is released and re-reserved in the same scan; genuine
+                # renewal uncertainty may RETRY only _STALE_LEASE_MAX_RETRY
+                # times before it too becomes a clean miss.
+                self._trace("lookup_cached_lease_stale")
+                stale = self._stale_lease_lookup(identity, ticket)
+                if stale == "retry":
+                    return None if not self.closed else False
+                if stale == "miss":
                     return False
-            return True
+                # "reserve": the dead lease is being released; fall through
+                # and make a fresh reservation for this chunk now. The data
+                # is still on disk -- only the lease died.
+            else:
+                if getattr(self.coordinator, "renew", None) is not None:
+                    if not self._notify("renew", ticket):
+                        if identity not in self.prepared:
+                            self._notify("release", ticket)
+                            self.loads.pop(identity)
+                        return False
+                return True
         if len(self.loads) + len(self.stores) + len(self._invalidations) >= self.capacity:
             self._forget_lookup_owner(identity[0])
+            self._note_lookup_reason("manager_capacity")
             return False  # clean miss, not unbounded scheduler retry
         admitted = self._admit_lookup(identity[0])
         if admitted is not True:
-            _trace("lookup_budget_retry" if admitted is None else "lookup_capacity_miss")
+            self._trace("lookup_budget_retry" if admitted is None else "lookup_capacity_miss")
             return admitted
         ticket = self._notify("reserve_load", self.namespace, key, identity[0])
         # Observability only: one fresh reserve_load consultation is one
@@ -431,18 +649,22 @@ class _Manager:
         self.tier_chunk_queries += 1
         if not ticket:
             self._forget_lookup_owner(identity[0])
+            self._note_lookup_reason("reserve_none")
             return False
         if not self._valid_ticket(ticket, key):
             self._notify("release", ticket)
             self._forget_lookup_owner(identity[0])
+            self._note_lookup_reason("reserve_invalid_ticket")
             return False
         self.tier_chunk_hits += 1
-        _trace("lookup_disk_hit")
+        self._trace("lookup_disk_hit")
         self.loads[identity] = ticket
         if self._async_metadata and not self._lease_valid(ticket):
-            self._renew_requested[ticket.token] = ticket
-            self._dispatch_metadata()
-            return None if not self.closed else False
+            self._trace("lookup_reserved_lease_stale")
+            stale = self._stale_lease_lookup(identity, ticket)
+            if stale == "retry":
+                return None if not self.closed else False
+            return False  # expired/bounded-out: clean miss, scan terminates
         return True
 
     def take_tier_stats(self):
@@ -457,13 +679,19 @@ class _Manager:
         return stats
 
     def prepare_load(self, keys: Collection[bytes], req_context):
-        _trace("prepare_load")
+        self._trace("prepare_load")
         keys = tuple(keys)
         identities = [self._identity(k, req_context) for k in keys]
         if len(set(keys)) != len(keys) or any(i not in self.loads for i in identities):
             raise ValueError("prepare_load requires unique previously reserved lookup hits")
-        if any(i in self._retiring_loads or i[1] in self._invalidations for i in identities):
-            raise ValueError("cannot prepare retiring or invalidated load tickets")
+        # A retiring marker with a live loads entry means an old dead lease is
+        # still being released while its replacement reservation (made by the
+        # stale-lease fall-through) is already vouched: that is safe to
+        # prepare. Only a marker with no live ticket, or a key veto, blocks.
+        if any(i in self._retiring_loads and i not in self.loads for i in identities):
+            raise ValueError("cannot prepare retiring load tickets")
+        if any(i[1] in self._invalidations for i in identities):
+            raise ValueError("cannot prepare invalidated load tickets")
         if any(i in self.prepared for i in identities):
             raise ValueError("load already in flight for this request and key")
         self.prepared.update(identities)
@@ -472,7 +700,8 @@ class _Manager:
                              self.namespace, req_context.req_id)
 
     def complete_load(self, keys, req_context):
-        _trace("complete_load")
+        self._trace("complete_load")
+        self._poll_metadata_if_due()
         # Native/core calls this only after all rank-local operations drained.
         for key in keys:
             identity = self._identity(key, req_context)
@@ -484,11 +713,13 @@ class _Manager:
                 else:
                     self._notify("release", ticket)
                     self.loads.pop(identity)
+            self._stale_retries.pop(identity, None)
             self.prepared.discard(identity)
         self._dispatch_metadata()
 
     def on_load_failure(self, keys, req_context):
-        _trace("on_load_failure")
+        self._trace("on_load_failure")
+        self._poll_metadata_if_due()
         # Core calls AFTER complete_load. Namespace is immutable for the manager,
         # so key+namespace remain available without retaining unbounded tombstones.
         failed_keys = set()
@@ -524,6 +755,7 @@ class _Manager:
         self._dispatch_metadata()
 
     def prepare_store(self, keys, req_context):
+        self._poll_metadata_if_due()
         if not self.can_store():
             return None
         selected, skipped, tickets = [], [], []
@@ -539,9 +771,11 @@ class _Manager:
                 continue
             if self._store_keys_left is not None:
                 if self._store_keys_left <= 0:
+                    self._note_lookup_reason("store_break_budget")
                     break
                 self._store_keys_left -= 1
             if len(self.loads) + len(self.stores) + len(self._invalidations) >= self.capacity:
+                self._note_lookup_reason("store_break_capacity")
                 break
             # None from reserve_store cannot distinguish pressure from existing
             # durable data. A successful all-rank read lease is the only evidence
@@ -570,20 +804,38 @@ class _Manager:
                     skipped.append(key)
                     continue
             if self.closed:
+                self._note_lookup_reason("store_break_closed")
                 break
             ticket = self._notify("reserve_store", self.namespace, key, identity[0],
                                   self.sizes[key_group(key, len(self.sizes))])
             if not ticket:
+                self._note_lookup_reason("store_reserve_declined")
                 continue
             if not self._valid_ticket(ticket, key):
                 self._notify("release", ticket)
+                self._note_lookup_reason("store_reserve_invalid")
                 continue
             self.stores[identity] = ticket
             selected.append(key)
             tickets.append(tuple(ticket.leases))
         self._dispatch_metadata()
         if not selected and not skipped:
+            self._note_lookup_reason("store_empty_output")
             return None
+        # Batch-shape probe (diagnostics only): how many keys the core offered
+        # vs how many this manager admitted/skipped, and which cache groups
+        # the offered keys belong to (small ints only, no key material).
+        # Bounded to a small batch of one-shot notes. 24 covers a full
+        # request's per-group store rotation plus its finish-drain passes,
+        # which is exactly where the load-path investigation needs
+        # visibility; it is still a fixed bound, not a log stream.
+        self._store_batch_notes = getattr(self, "_store_batch_notes", 0)
+        if self._store_batch_notes < 24:
+            self._store_batch_notes += 1
+            groups = sorted({key_group(k, len(self.sizes)) for k in tuple(keys)})
+            _emit_trace("store batch #%d: offered=%d selected=%d skipped=%d groups=%s",
+                        self._store_batch_notes, len(tuple(keys)),
+                        len(selected), len(skipped), groups)
         # skipped_keys is a required companion-core extension, not an upstream
         # field at 83252ea89 either. Unpatched core is not a safe supported
         # configuration; patches/persistence-flash/0001 adds it.
@@ -604,6 +856,7 @@ class _Manager:
         return not self.closed
 
     def complete_store(self, keys, req_context, success=True):
+        self._poll_metadata_if_due()
         for key in keys:
             identity = self._identity(key, req_context)
             ticket = self.stores.get(identity)
@@ -621,6 +874,7 @@ class _Manager:
         return self.context_cls()
 
     def on_request_finished(self, req_context):
+        self._poll_metadata_if_due()
         owner = req_context.req_id
         if (any(i[0] == owner for i in self.prepared)
                 or any(i[0] == owner and i not in self._retiring_stores for i in self.stores)):
@@ -634,6 +888,7 @@ class _Manager:
                 else:
                     self._notify("release", ticket)
                     self.loads.pop(identity)
+                self._stale_retries.pop(identity, None)
         self._dispatch_metadata()
 
     def touch(self, keys, req_context):
@@ -643,6 +898,7 @@ class _Manager:
         return ()
 
     def has_pending_work(self):
+        self._poll_metadata_if_due()
         return bool(self.prepared or self.stores or self._metadata_pending()
                     or (not self.closed and self._lookup_owners))
 
@@ -666,6 +922,7 @@ class _Manager:
             self._rotate_lookup_turn()
 
     def reset_cache(self):
+        self._poll_metadata_if_due()
         if self._namespace_quarantined:
             raise RuntimeError("namespace quarantine overflow requires external recovery")
         if self.prepared or any(i not in self._retiring_stores for i in self.stores):
@@ -814,6 +1071,7 @@ def _load_native():
 
         def __init__(self, config):
             super().__init__(config)
+            _enable_offload_scheduler_debug()
             if self.blocks_per_chunk != 1:
                 raise ValueError("disk persistence supports blocks_per_chunk=1 only")
             # The canonical host layout (2c4d348848, #48408) makes one rank the
@@ -857,6 +1115,16 @@ def _load_native():
                           "metadata_workers", "metadata_max_submitted"):
                 if type(extra.get(field)) is not int or extra[field] <= 0:
                     raise ValueError(f"positive integer {field} required")
+            # R3 read gate (DESIGN-EVICT-ONLY-SPIKE-20260912): requests
+            # smaller than this skip the disk lookup entirely -- a small
+            # RAM-miss recomputes cheaper than the scan+read would cost.
+            # The gate is by REQUEST size (prompt tokens), never by miss
+            # size; the write path stays size-agnostic.
+            min_lookup = extra.get("min_disk_lookup_tokens", 4096)
+            if (type(min_lookup) is not int
+                    or not 0 <= min_lookup <= 10_000_000):
+                raise ValueError("min_disk_lookup_tokens must be a bounded non-negative integer")
+            extra["min_disk_lookup_tokens"] = min_lookup
             if (extra["metadata_workers"] > 32 or not extra["metadata_workers"]
                     <= extra["metadata_max_submitted"] <= 4096):
                 raise ValueError("metadata worker/submission bounds are invalid")

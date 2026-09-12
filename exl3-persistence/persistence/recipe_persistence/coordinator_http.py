@@ -37,6 +37,7 @@ import hmac
 import hashlib
 import ipaddress
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -60,6 +61,20 @@ _REQUEST_ID = re.compile(r"[0-9a-f]{32,64}")
 _LEASE = re.compile(r"[0-9a-f]{32}")
 _MAX_JSON_SIZE = 1 << 20
 _MAX_SIZE_FIELD = 1 << 40  # JSON sanity bound; the store enforces its own cap.
+
+_LOG = logging.getLogger(__name__)
+
+
+def _emit_note(message: str, *args) -> None:
+    """Diagnostics level gate, same contract as native._emit_trace.
+
+    Static codes only; nothing identifying may reach a log line.
+    """
+    if os.environ.get("PERSIST_DEBUG_TRACE", "").strip().lower() not in (
+            "", "0", "false", "no"):
+        _LOG.warning(message, *args)
+    else:
+        _LOG.info(message, *args)
 
 # Fixed RPC allowlist. Dispatch is a dict lookup, never getattr, so no request
 # can execute arbitrary methods or touch file paths.
@@ -482,12 +497,16 @@ class _MetadataRPC:
         self.world_size = world_size
         self.profile = profile
         self.group_count = len(identity["group_refs"])
+        # 0010: static counter for fast-negative reserve_read short-circuits
+        # (observable, never silent -- the design's gate-metric analogue).
+        self.absent_index_skips = 0
         self.lease_seconds = float(store.limits.lease_seconds)
         self._idem = OrderedDict()   # request_id -> (payload, expiry); bounded LRU.
         self._pending = OrderedDict()  # request_id -> Event for in-flight computes.
         self._idem_cap = int(idem_entries)
         self._idem_lock = threading.Lock()
         self._wait = max(0.5, min(5.0, self.lease_seconds))
+        self._read_refusal_notes = 0  # Bounded why-refusal probe (diagnostics).
 
     def geometry_payload(self):
         ident = self.identity
@@ -597,6 +616,15 @@ class _MetadataRPC:
         request_id = params["request_id"]
         # Validate the envelope before registering ownership of the request id.
         namespace, key, owner = self._validated_common(params)
+        # 0010: authoritative fast negative from the store's in-RAM durable
+        # index. Absent keys skip the idempotent replay lookup, the store's
+        # reserve_read (index SELECT + file stat), and the why-refusal probe
+        # (which would itself re-read the index). A cached lease for a key
+        # that became absent is dead anyway (invalidate semantics), so
+        # short-circuiting before the replay cache is correct.
+        if not self.store.durable(namespace, key):
+            self.absent_index_skips += 1
+            return {"ok": True, "lease": None}
         signature = ("read", namespace, key, owner)
         cached = self._idempotent(request_id, signature)
         if cached is not None:
@@ -608,6 +636,16 @@ class _MetadataRPC:
             lease = None
             if self._group_of(key) is not None:
                 lease = self.store.reserve_read(namespace, key, owner)
+                if lease is None:
+                    # Why-refusal probe (diagnostics only, static codes):
+                    # distinguishes "object absent" (store miss) from lease
+                    # capacity / failed state. exists() is one indexed read.
+                    # Bounded: at most three notes per server instance.
+                    if self._read_refusal_notes < 3:
+                        self._read_refusal_notes += 1
+                        _emit_note("reserve_read refused: exists=%s failed=%s closed=%s",
+                                   bool(self.store.exists(namespace, key)),
+                                   bool(self.store.failed), bool(self.store.closed))
             payload = {"ok": True, "lease": lease}
             self._remember(request_id, signature, payload)
             return payload
@@ -797,6 +835,14 @@ class RemoteCoordinator:
         self._retry = deque(maxlen=8192)  # Bounded cleanup replay log.
         self._cleanup_lost = False
         self._closed = False
+        self._reserve_reasons = {}  # Diagnostics only: why a reservation refused.
+
+    def _note_reserve(self, code):
+        reasons = self._reserve_reasons
+        reasons[code] = reasons.get(code, 0) + 1
+        if reasons[code] <= 3:
+            _emit_note("reserve reason %s (#%d): %s",
+                       code, reasons[code], sorted(reasons.items()))
 
     # -- validation helpers ------------------------------------------------ #
 
@@ -868,20 +914,48 @@ class RemoteCoordinator:
         identity = (namespace, key, owner, writing)
         charge = max(sizes)
         with self._lock:
-            if self._closed or (namespace, key) in self._invalid:
+            if self._closed:
+                self._note_reserve("closed")
+                return None
+            if (namespace, key) in self._invalid:
+                self._note_reserve("veto_invalid")
                 return None
             token = self._identities.get(identity)
-            if token is not None:
-                if token in self._retiring:
-                    return None
-                ticket = self._tickets[token]
-                if self.renew(ticket):
-                    return ticket
+            ticket = self._tickets.get(token) if token is not None else None
+            retiring = token in self._retiring if token is not None else False
+        if retiring:
+            self._note_reserve("identity_retiring")
+            return None
+        if ticket is not None:
+            # B3: renew OUTSIDE the global lock. A blocking all-rank renew
+            # RPC used to run with the lock held, stalling every unrelated
+            # lease_deadline check behind it; re-validating under the lock
+            # after the RPC keeps the identity semantics exact.
+            if self.renew(ticket):
+                with self._lock:
+                    if (self._identities.get(identity) == token
+                            and token not in self._retiring
+                            and (namespace, key) not in self._invalid
+                            and not self._closed):
+                        return ticket
+                # Concurrently released or invalidated: fall through to a
+                # fresh reservation.
+            else:
                 self.release(ticket)
+                self._note_reserve("identity_renew_dead")
+                return None
+        with self._lock:
+            if self._closed or (namespace, key) in self._invalid:
                 return None
             if (identity in self._pending
                     or len(self._tickets) + len(self._pending) >= self.max_pending_keys
                     or self._bytes + charge > self.max_pending_bytes):
+                if identity in self._pending:
+                    self._note_reserve("identity_pending")
+                elif len(self._tickets) + len(self._pending) >= self.max_pending_keys:
+                    self._note_reserve("capacity_keys")
+                else:
+                    self._note_reserve("capacity_bytes")
                 return None
             # Pending descriptor/byte credits exist before network work, not
             # merely when the winning response is inserted into the ticket map.
@@ -902,13 +976,19 @@ class RemoteCoordinator:
 
             results = self.client.fanout(method, params_for)
             complete = len(results) == self.world_size
+            rank_failures = 0
             # Never break at an unsuccessful rank: later successes own leases.
             for rank, result in enumerate(results[:self.world_size]):
                 self._record_failure(result)
                 lease = result.get("lease") if isinstance(result, dict) else None
                 if not isinstance(lease, str) or not _LEASE.fullmatch(lease):
                     complete = False
-                else:
+                    rank_failures += 1
+            if rank_failures:
+                self._note_reserve(f"rank_lease_missing_{rank_failures}")
+            for rank, result in enumerate(results[:self.world_size]):
+                lease = result.get("lease") if isinstance(result, dict) else None
+                if isinstance(lease, str) and _LEASE.fullmatch(lease):
                     leases[rank] = lease
             valid_until = started + self._ttl - self._margin
             with self._lock:
@@ -922,6 +1002,14 @@ class RemoteCoordinator:
                     self._pending.remove(identity)
                     accepted = True
                     return ticket
+                if not complete:
+                    self._note_reserve("fanout_incomplete")
+                elif self._closed:
+                    self._note_reserve("closed")
+                elif (namespace, key) in self._invalid:
+                    self._note_reserve("veto_invalid")
+                else:
+                    self._note_reserve("window_expired")
             return None
         finally:
             if not accepted:
@@ -1317,6 +1405,23 @@ def factory(*, config=None, role="scheduler", rank=None, world_size=None, geomet
             # startup deadline and fails closed on mismatch.
             client = RpcClient(endpoints, token, rpc_timeout=rpc_timeout,
                                pool_size=pool_size, max_body=max_body)
+            # 0010: the rank-local leg dispatches in-process. The error map
+            # mirrors the HTTP status mapping exactly so fail-closed
+            # semantics are identical on both legs:
+            #   ValueError -> 400 -> _Permanent (peer rejected)
+            #   _RetryAgain -> 503 -> _Transient (peer unavailable)
+            #   _BackendUnavailable -> 410 -> _Permanent (rank disabled)
+            #   anything else -> 500 -> _Transient (execution failed)
+            def _map_local_error(error):
+                if isinstance(error, _BackendUnavailable):
+                    return _Permanent("RPC peer rejected request")
+                if isinstance(error, _RetryAgain):
+                    return _Transient("RPC peer unavailable")
+                if isinstance(error, ValueError):
+                    return _Permanent("RPC peer rejected request")
+                return _Transient("RPC execution failed")
+            client.bind_local_dispatch(rank, server.rpc.dispatch,
+                                       _map_local_error)
             infos = _census(client, world_size, startup_timeout=startup_timeout,
                             own_rank=rank, own_row=identity["group_bytes"],
                             expected_profile=profile)

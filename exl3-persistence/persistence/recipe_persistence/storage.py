@@ -93,6 +93,13 @@ class DiskStore:
         self.db = None
         self._dirfd = None
         self._lockfile = None
+        # 0010: in-RAM index of durable (namespace, key) pairs. Every
+        # durability transition funnels through this class, so the set is
+        # authoritative for the fast negative: reserve_read on an absent
+        # key short-circuits before _expire()/lease accounting/the index
+        # SELECT/the file stat. None (unbuilt) = permissive fallback to
+        # the SQL path, preserving pre-0010 behaviour exactly.
+        self._durable = None
         try:
             self._initialize(root, limits, clock=clock,
                                journal_mode=journal_mode, synchronous=synchronous)
@@ -243,7 +250,12 @@ class DiskStore:
         with self._lock, self._tx():
             self.db.execute("DELETE FROM leases")
             self.db.execute("UPDATE objects SET state='T',expiry=0 WHERE state='W'")
-            self.db.execute("UPDATE objects SET expiry=0 WHERE state='C'")
+            # Restored committed objects get a fresh eligibility window, not
+            # instant eviction: this store exists to serve what survived the
+            # restart, and evict() runs at startup. (Reads and write renewals
+            # extend the same clock; see reserve_read/read_into/renew.)
+            self.db.execute("UPDATE objects SET expiry=? WHERE state='C'",
+                            (self.clock() + self.limits.lease_seconds,))
             self.db.execute("UPDATE objects SET charge=((size+?+?-1)/?+1)*?",
                             (HEADER_BYTES,self._unit,self._unit,self._unit))
             self.db.execute("UPDATE totals SET bytes=(SELECT COALESCE(SUM(charge),0) FROM objects) WHERE id=1")
@@ -269,11 +281,70 @@ class DiskStore:
         self.collect(force=True)
         # A smaller configured quota after restart must not serve an oversized
         # retained namespace; no old process leases survive exclusive startup.
-        self.evict()
+        # Normal eviction honours the fresh eligibility window every committed
+        # object just received, so an over-full retained cache would be stuck:
+        # reclaim it FORCED, oldest-touched first, down to the low watermark.
+        # The window protects a warm cache from instant LRU eviction, not from
+        # a shrunken quota.
+        if self.usage() > self.limits.high:
+            with self._lock, self._tx():
+                self._expire()
+                marked = self.db.execute(
+                    "SELECT COALESCE(SUM(charge),0) FROM objects WHERE state='T'"
+                ).fetchone()[0]
+                while self.usage() - marked > self.limits.low:
+                    row = self.db.execute(
+                        "SELECT id,charge FROM objects WHERE state='C' "
+                        "ORDER BY touched LIMIT 1").fetchone()
+                    if not row:
+                        break
+                    self.db.execute("UPDATE objects SET state='T',expiry=? WHERE id=?",
+                                    (self.clock()+self.limits.grace_seconds, row[0]))
+                    marked += row[1]
         self.collect(force=True)
         if self.failed or self.usage() > self.limits.quota:
             self.close()
             raise ValueError("recovery could not establish the hard quota")
+        # 0010: the durable-key index is built only after every recovery
+        # sweep above (W reset, file-validity tombstones, forced reclaim)
+        # has settled, so the set matches exactly the rows that can serve.
+        self._rebuild_durable()
+
+    def _rebuild_durable(self):
+        """(Re)build the in-RAM durable-key set from state='C' rows.
+
+        None on failure: durable() then answers True, preserving the
+        pre-0010 SQL path (correct, just slower).
+        """
+        with self._lock:
+            try:
+                self._durable = {
+                    (ns, key)
+                    for ns, key in self.db.execute(
+                        "SELECT ns,key FROM objects WHERE state='C'")
+                }
+            except _ERRORS:
+                self._durable = None
+
+    def durable(self, namespace, key) -> bool:
+        """O(1) membership test for a durable object (0010).
+
+        True when the index is unbuilt (permissive fallback) or the pair
+        is present. Callers may consult this before the SQL path; it is
+        advisory for positives and authoritative for negatives.
+        """
+        durable = self._durable
+        return True if durable is None else (namespace, key) in durable
+
+    def _note_durable(self, namespace, key):
+        durable = self._durable
+        if durable is not None:
+            durable.add((namespace, key))
+
+    def _forget_durable(self, namespace, key):
+        durable = self._durable
+        if durable is not None:
+            durable.discard((namespace, key))
 
     def usage(self):
         with self._lock:
@@ -328,12 +399,43 @@ class DiskStore:
                     return None
                 with self._tx():
                     self._expire()
-                    if self.db.execute("SELECT 1 FROM objects WHERE ns=? AND key=?", (namespace,key)).fetchone():
-                        return None
+                    # B5/B6: the duplicate guard is state-aware. A LIVE
+                    # ('C') row still refuses the write. A TOMBSTONE ('T')
+                    # row is superseded atomically under the new object:
+                    # its bytes are reclaimed, its files unlinked, and the
+                    # new write takes the (ns,key) -- so an invalidated key
+                    # is rewritable immediately instead of being blocked
+                    # for the whole grace window, and tombstones no longer
+                    # count toward max_objects (they hold no live data).
+                    # A tombstone still under a live read lease is NOT
+                    # superseded: the reader's file must stay put until
+                    # its lease expires (a bounded wait).
+                    row = self.db.execute(
+                        "SELECT id,state,charge FROM objects WHERE ns=? AND key=?",
+                        (namespace, key)).fetchone()
+                    if row is not None:
+                        old_id, old_state, old_charge = row
+                        # 'C' refuses (live duplicate); 'W' refuses (a
+                        # concurrent writer holds the key). Only 'T' is
+                        # superseded.
+                        if old_state != 'T':
+                            return None
+                        if self.db.execute(
+                                "SELECT 1 FROM leases WHERE object=?", (old_id,)).fetchone():
+                            return None
+                        for partial in (False, True):
+                            try:
+                                self._path(old_id, partial).unlink()
+                            except FileNotFoundError:
+                                pass
+                        self.db.execute("DELETE FROM objects WHERE id=?", (old_id,))
+                        self.db.execute("UPDATE totals SET bytes=bytes-? WHERE id=1", (old_charge,))
                     charge = self._charge(size)
                     if self.usage() + charge > self.limits.quota:
                         return None
-                    if self.db.execute("SELECT COUNT(*) FROM objects").fetchone()[0] >= self.limits.max_objects:
+                    if self.db.execute(
+                            "SELECT COUNT(*) FROM objects WHERE state != 'T'"
+                            ).fetchone()[0] >= self.limits.max_objects:
                         return None
                     fs = os.statvfs(self.root)
                     pending = self.db.execute("SELECT COALESCE(SUM(charge),0) FROM objects WHERE state='W'").fetchone()[0]
@@ -413,6 +515,8 @@ class DiskStore:
                 with self._tx():
                     self.db.execute("UPDATE objects SET state='C',expiry=?,touched=? WHERE id=?",
                                     (self.clock()+self.limits.lease_seconds,self.clock(),token))
+                # 0010: the pair is durable from this commit onward.
+                self._note_durable(ns, key)
                 return True
         except Exception:
             if path is not None:
@@ -448,6 +552,8 @@ class DiskStore:
         try:
             self._identity(namespace,key)
             with self._lock:
+                if not self.durable(namespace, key):
+                    return False
                 row = self.db.execute("SELECT id,size FROM objects WHERE ns=? AND key=? AND state='C'", (namespace,key)).fetchone()
                 return bool(row and not self.failed and self._path(row[0]).stat().st_size == HEADER_BYTES+row[1])
         except _ERRORS:
@@ -459,6 +565,12 @@ class DiskStore:
             with self._lock, self._tx():
                 if self.failed or self.closed:
                     return None
+                # 0010: authoritative fast negative. An absent key skips
+                # _expire(), lease accounting, the index SELECT AND the
+                # file stat -- this is the per-key cost the lookup scan
+                # pays across all ranks on every miss.
+                if not self.durable(namespace, key):
+                    return None
                 self._expire()
                 if self.db.execute("SELECT COUNT(*) FROM leases").fetchone()[0] >= self.limits.max_leases:
                     return None
@@ -467,6 +579,12 @@ class DiskStore:
                     return None
                 token = uuid.uuid4().hex
                 self.db.execute("INSERT INTO leases VALUES(?,?,?,?)", (token,row[0],owner,self.clock()+self.limits.lease_seconds))
+                # Serving an object proves it is live: extend its eviction
+                # eligibility the same way a write renew does, so a hot
+                # restored prefix is not tombstoned under quota pressure
+                # merely because its last WRITE is older than lease_seconds.
+                self.db.execute("UPDATE objects SET expiry=? WHERE id=?",
+                                (self.clock()+self.limits.lease_seconds, row[0]))
                 return token
         except _ERRORS:
             return None
@@ -510,11 +628,19 @@ class DiskStore:
                     if read != size or f.read(1) or digest.digest() != checksum:
                         raise ValueError("payload integrity failure")
                     self._drop_cache(f.fileno())
-                self.db.execute("UPDATE objects SET touched=? WHERE id=?", (self.clock(),ident))
+                now = self.clock()
+                # Extend eviction eligibility only for LIVE objects: a
+                # tombstone's expiry is its grace deadline, and a reader of a
+                # tombstoned object must not push that deadline out (collect
+                # would then retain bytes the invalidation promised to drop).
+                self.db.execute("UPDATE objects SET touched=?,expiry=? WHERE id=? AND state='C'",
+                                (now, now+self.limits.lease_seconds, ident))
                 return True
             except Exception:
                 if ident:
                     self._retire(ident)
+                    # 0010: a read-side failure tombstones a durable object.
+                    self._forget_durable(ns, key)
                 return False
 
     def _retire(self, ident):
@@ -531,6 +657,8 @@ class DiskStore:
                 row = self.db.execute("SELECT id FROM objects WHERE ns=? AND key=?", (namespace,key)).fetchone()
                 if row:
                     self._retire(row[0])
+                    # 0010: an invalidated key is no longer durable.
+                    self._forget_durable(namespace, key)
                 return not self.failed
         except _ERRORS:
             self.failed = True
@@ -593,10 +721,12 @@ class DiskStore:
                     marked = self.db.execute("SELECT COALESCE(SUM(charge),0) FROM objects WHERE state='T'").fetchone()[0]
                     count = 0
                     while usage-marked > self.limits.low:
-                        row = self.db.execute("SELECT id,charge FROM objects WHERE state='C' AND expiry<=? AND NOT EXISTS(SELECT 1 FROM leases WHERE object=objects.id) ORDER BY touched LIMIT 1", (self.clock(),)).fetchone()
+                        row = self.db.execute("SELECT id,charge,ns,key FROM objects WHERE state='C' AND expiry<=? AND NOT EXISTS(SELECT 1 FROM leases WHERE object=objects.id) ORDER BY touched LIMIT 1", (self.clock(),)).fetchone()
                         if not row:
                             break
                         self.db.execute("UPDATE objects SET state='T',expiry=? WHERE id=?", (self.clock()+self.limits.grace_seconds,row[0]))
+                        # 0010: reclaimed keys are no longer durable.
+                        self._forget_durable(row[2], row[3])
                         marked += row[1]
                         count += 1
                     return count

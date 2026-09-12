@@ -178,7 +178,12 @@ class RpcClient:
         if type(max_body) is not int or not 1 <= max_body <= 1024 * 1024:
             raise ValueError("positive bounded metadata body required")
         active = min(len(endpoints), 8) if max_active is None else max_active
-        pending = active * pool_size if max_pending is None else max_pending
+        # B1: the raw active*pool default rejected healthy concurrent
+        # callers (one saturated admission slot surfaced as a spurious
+        # rank failure and rolled back healthy reservations). Floor the
+        # default admission window so bursty cleanup+renewal fan-out fits;
+        # explicit configuration still wins, and the bound stays bounded.
+        pending = max(active * pool_size * 2, 64) if max_pending is None else max_pending
         if type(active) is not int or not 1 <= active <= 128:
             raise ValueError("positive bounded active RPC count required")
         if type(pending) is not int or not active <= pending <= 16384:
@@ -187,6 +192,11 @@ class RpcClient:
         self._numeric = tuple(parsed)
         self._token = token.encode("ascii")
         self.timeout = rpc_timeout
+        # 0010: rank-local in-process dispatch (unbound until the worker
+        # factory binds the co-located MetadataServer's rpc.dispatch).
+        self._local_rank = None
+        self._local_dispatch = None
+        self._local_error_map = None
         self._pool_size, self._max_body = pool_size, max_body
         self.max_active, self.max_pending = active, pending
         self._condition = threading.Condition(threading.RLock())
@@ -407,8 +417,48 @@ class RpcClient:
                 self._condition.notify_all()
         return result if result is not None else _Transient("RPC execution failed")
 
+    def bind_local_dispatch(self, rank, dispatch, map_error):
+        """Bind the rank-local coordinator's in-process dispatch (0010).
+
+        The worker role builds its MetadataServer in this process, so the
+        localhost HTTP leg is pure overhead. `dispatch(method, wire_params)`
+        must accept exactly the wire-format params the HTTP handler passes
+        to ``_MetadataRPC.dispatch``; `map_error(exception)` must return
+        the client-visible exception the HTTP status mapping would
+        produce (400/410 -> _Permanent, 503/500 -> _Transient), keeping
+        fail-closed semantics identical on both legs.
+        """
+        if type(rank) is not int or not 0 <= rank < len(self.endpoints):
+            raise ValueError("local dispatch rank out of range")
+        if not callable(dispatch) or not callable(map_error):
+            raise ValueError("dispatch and map_error must be callable")
+        self._local_rank = rank
+        self._local_dispatch = dispatch
+        self._local_error_map = map_error
+
+    def _local_call(self, method, params):
+        try:
+            return self._local_dispatch(method, params)
+        except Exception as error:
+            raise self._local_error_map(error) from error
+
     def call(self, rank, method, **params):
-        operation = self._admit(rank, method, lambda: params, time.monotonic() + self.timeout)
+        # 0010 local leg: rank-local traffic dispatches in-process; the
+        # error map preserves the wire path's status semantics exactly.
+        if self._local_dispatch is not None and rank == self._local_rank:
+            return self._local_call(method, params)
+        # B2: an admission-capacity rejection is transient by definition;
+        # retry it briefly instead of failing the operation (which the
+        # coordinator treated as a rank failure and rolled back).
+        deadline = time.monotonic() + self.timeout
+        for attempt in range(4):
+            try:
+                operation = self._admit(rank, method, lambda: params, deadline)
+                break
+            except _Transient:
+                if attempt == 3:
+                    raise
+                time.sleep(0.01 * (attempt + 1))
         try:
             result = self._execute(operation)
             if isinstance(result, Exception):
@@ -435,10 +485,40 @@ class RpcClient:
     def fanout(self, method, params_for):
         """Return one result-or-Exception per rank within one absolute deadline."""
         deadline = time.monotonic() + self.timeout
+        local_rank = self._local_rank
+        local = self._local_dispatch
         operations = []
+        local_results = {}
         for rank in range(len(self.endpoints)):
+            # 0010: the rank-local leg dispatches in-process; it still
+            # consumes one slot of the results vector, in rank order.
+            if local is not None and rank == local_rank:
+                try:
+                    local_results[rank] = self._local_call(
+                        method, params_for(rank))
+                except Exception as error:
+                    local_results[rank] = error
+                operations.append(None)  # index placeholder; result above
+                continue
+            # B2: retry admission-capacity rejections briefly (transient
+            # by definition) before reporting a rank failure.
+            operation = None
+            for attempt in range(4):
+                try:
+                    operation = self._admit(rank, method, lambda rank=rank: params_for(rank), deadline)
+                    break
+                except _Transient:
+                    if attempt == 3:
+                        operation = _Transient("RPC admission capacity exhausted")
+                    else:
+                        time.sleep(0.01 * (attempt + 1))
+                except Exception as error:
+                    operation = error
+                    break
+            if isinstance(operation, Exception):
+                operations.append(operation)
+                continue
             try:
-                operation = self._admit(rank, method, lambda rank=rank: params_for(rank), deadline)
                 with self._condition:
                     operation.future = Future()
                     if self._closed:
@@ -451,7 +531,10 @@ class RpcClient:
             except Exception as error:
                 operations.append(error)
         results = []
-        for operation in operations:
+        for rank, operation in enumerate(operations):
+            if operation is None:
+                results.append(local_results[rank])
+                continue
             if isinstance(operation, Exception):
                 results.append(operation)
                 continue
