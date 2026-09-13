@@ -11,7 +11,7 @@ Full measured report: https://services.turquoisebay.ai/share/glm53-exl3-writebeh
 
 The engine side of this work is a branch on a public vLLM fork:
 **[`hughmadden/vllm` `persistence/writebehind-disk-kv`](https://github.com/hughmadden/vllm/tree/persistence/writebehind-disk-kv)** —
-upstream `83252ea899` plus twelve commits, one per patch, all inside the v1
+upstream `83252ea899` plus thirteen commits, one per patch, all inside the v1
 KV-offload connector (plus one hook each in the block pool and scheduler). This
 repository carries no vLLM code: it pins that branch by commit and hash and holds
 everything around it (the NVMe backend package, configs, probes, tests, records).
@@ -70,6 +70,10 @@ everything around it (the NVMe backend package, configs, probes, tests, records)
   decode cost by construction.
 - **0013** removes the request-path store code (the 339-line walk, finish-hold,
   partial-tail builder, frontier helpers): evict-only is the only code path.
+- **0014** the mamba-scan fix: the idle-time flusher's population becomes the pool
+  hash index UNION request-path block identities (_seen_blocks), so mamba/KDA groups
+  (underrepresented in the pool index) can become durable; the 0008 kpool
+  (non-cacheable) exclusion is mirrored into the scan.
 
 ## Current measured state (2026-09-13)
 

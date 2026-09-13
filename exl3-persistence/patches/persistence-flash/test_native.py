@@ -266,14 +266,18 @@ class CompletionTests(unittest.TestCase):
 
 
 class CursorTests(unittest.TestCase):
-    def state(self, configs=None, select=None):
+    def state(self, configs=None, select=None, cacheable=None):
         env = classes()
         groups = configs or [(64, False, None, None)]
         # `align` drives the upstream reachability mask (SWA/retention filters);
         # `_reachable_store_block_mask` itself is upstream and is faked here.
+        # `cacheable` (parallel to `groups`) stamps kv_cache_spec.prefix_cacheable
+        # so 0014 scan tests can exercise the 0008 kpool exclusion guard.
         configs = [NS(group_idx=i, tokens_per_chunk=size, tokens_per_block=size,
                       is_eagle_group=eagle, alignment_block_count=align,
-                      requires_cow_source=False, kv_cache_spec=None,
+                      requires_cow_source=False,
+                      kv_cache_spec=(NS(prefix_cacheable=cacheable[i])
+                                     if cacheable is not None else None),
                       sliding_window_size_in_chunks=tail)
                    for i, (size, eagle, align, tail) in enumerate(groups)]
         states = tuple(NS(offload_keys=[(i, j) for j in range(24)],
@@ -529,6 +533,157 @@ class CursorTests(unittest.TestCase):
         job_id = next(iter(jobs))
         self.assertIn(job_id, obj._block_id_to_pending_jobs.get(stale_bid, set())
                       | obj._block_id_to_pending_jobs.get(unseen_bid, set()))
+
+class IdleFlushMambaScanTests(unittest.TestCase):
+    """0014: the idle-time scan population is the UNION of the pool hash
+    index and the request-path ``_seen_blocks`` identities, so mamba/KDA
+    blocks the index underrepresents can become durable; non-cacheable
+    (kpool) groups are excluded; dead entries are pruned."""
+
+    def setUp(self):
+        cursor = CursorTests()
+        # Groups 0 (cacheable), 1 (kpool scratch, prefix_cacheable=False),
+        # 2 (mamba, cacheable) -- the census layout's relevant shape.
+        (self.obj, _, self.states, self.offered, _
+         ) = cursor.state(
+            [(64, False, None, None)] * 3, cacheable=(True, False, True))
+        obj = self.obj
+        obj._evict_only = True
+        obj._idle_flush_enabled = True
+        obj._idle_flush_stale_seconds = 100.0
+        obj._idle_flush_per_scan = 32
+        obj._idle_flush_scan_seconds = 0.0
+        obj._last_flush_scan = 0.0
+        obj._block_last_seen = {}
+        obj._seen_blocks = {}
+        obj.idle_flush_candidates = 0
+        obj.idle_flush_enqueued = 0
+        obj.idle_flush_skipped_fresh = 0
+        obj._held_evictions = {}
+        obj._block_id_to_pending_jobs = {}
+        obj._jobs = {}
+        obj._block_pool = NS(cached_block_hash_to_block=NS(_cache={}))
+        self.env = {
+            "get_block_hash": lambda key: key[:-4],
+            "get_group_id": lambda key: int.from_bytes(key[-4:], "big"),
+            "make_offload_key": extract("vllm/v1/kv_offload/base.py",
+                                        "make_offload_key",
+                                        {"OffloadKey": bytes}),
+            "GPULoadStoreSpec": lambda ids, **kw: NS(block_ids=ids, **kw),
+            "TransferJobStatus": extract(OFF+"scheduler.py", "TransferJobStatus"),
+            "TransferJob": extract(OFF+"common.py", "TransferJob"),
+        }
+        bind(obj, OFF+"scheduler.py", "_scan_idle_flush", self.env)
+
+    @staticmethod
+    def key(tag, group_idx):
+        # BlockHashWithGroupId layout: block_hash || 4-byte BE group id.
+        return bytes([tag]) * 30 + group_idx.to_bytes(4, "big")
+
+    def stale(self, *bids):
+        now = time.monotonic()
+        for bid in bids:
+            self.obj._block_last_seen[bid] = now - 10_000
+
+    def test_mamba_block_only_in_seen_blocks_is_offered(self):
+        """0014 core fix: a mamba (group 2) block the pool hash index
+        never saw IS offered via the request-path union (census: after a
+        long flush run the map held ONE mamba object per group vs ~380
+        per group in the store's request-path history)."""
+        obj = self.obj
+        mamba_bid = 7000
+        raw = self.key(7, 2)
+        obj._seen_blocks[mamba_bid] = (raw, 2)
+        self.stale(mamba_bid)
+        # referenced by the tracked request so the prune keeps it
+        obj._req_status["r"].group_states[2].block_ids.append(mamba_bid)
+        jobs = obj._scan_idle_flush(NS(num_scheduled_tokens={}))
+        self.assertEqual(len(jobs), 1)
+        job_id = next(iter(jobs))
+        self.assertEqual(obj._jobs[job_id].keys, {raw})
+        self.assertIn(mamba_bid, obj._block_id_to_pending_jobs)
+        self.assertIn(job_id, obj._block_id_to_pending_jobs[mamba_bid])
+        self.assertEqual(obj.idle_flush_enqueued, 1)
+
+    def test_block_in_both_sources_offered_once(self):
+        """0014: the union dedupes by block_id -- a block present in both
+        the pool map and _seen_blocks is offered exactly once."""
+        obj = self.obj
+        bid = 500
+        raw = self.key(5, 0)
+        obj._block_pool.cached_block_hash_to_block._cache[raw] = {
+            bid: NS(block_id=bid)}
+        obj._seen_blocks[bid] = (raw, 0)
+        self.stale(bid)
+        obj._req_status["r"].group_states[0].block_ids.append(bid)
+        jobs = obj._scan_idle_flush(NS(num_scheduled_tokens={}))
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(obj.idle_flush_enqueued, 1)
+        self.assertEqual(self.offered, [[raw]])
+
+    def test_noncacheable_kpool_seen_entry_is_skipped(self):
+        """0014 discovered item: the flusher must not publish the 0008
+        kpool rolling scratch (prefix_cacheable=False). Its blocks never
+        enter the pool hash index (manager cache_blocks no-ops), but the
+        request path sees them -- the guard is load-bearing for the
+        _seen_blocks source."""
+        obj = self.obj
+        kpool_bid, cache_bid = 1101, 400
+        raw_kpool, raw_ok = self.key(9, 1), self.key(4, 0)
+        obj._seen_blocks[kpool_bid] = (raw_kpool, 1)
+        obj._seen_blocks[cache_bid] = (raw_ok, 0)
+        self.stale(kpool_bid, cache_bid)
+        obj._req_status["r"].group_states[1].block_ids.append(kpool_bid)
+        obj._req_status["r"].group_states[0].block_ids.append(cache_bid)
+        jobs = obj._scan_idle_flush(NS(num_scheduled_tokens={}))
+        self.assertEqual(self.offered, [[raw_ok]])
+        self.assertEqual(obj.idle_flush_enqueued, 1)
+
+    def test_seen_blocks_entry_for_dead_block_is_pruned(self):
+        """0014: _seen_blocks is pruned with live-set logic -- a block
+        neither in the pool map nor referenced by any tracked request is
+        dropped (bounds growth and blocks id-recycling corruption)."""
+        obj = self.obj
+        live_bid, dead_bid = 201, 999
+        obj._seen_blocks[live_bid] = (self.key(2, 2), 2)
+        obj._seen_blocks[dead_bid] = (self.key(3, 2), 2)
+        self.stale(live_bid, dead_bid)
+        obj._req_status["r"].group_states[2].block_ids.append(live_bid)
+        obj._scan_idle_flush(NS(num_scheduled_tokens={}))
+        self.assertIn(live_bid, obj._seen_blocks)
+        self.assertNotIn(dead_bid, obj._seen_blocks)
+        self.assertNotIn(dead_bid, obj._block_last_seen)
+
+    def test_track_block_seen_records_group_identities(self):
+        """0014: _track_block_seen mirrors update_offload_keys' chunk<->
+        hash pairing for EVERY group (mamba included): chunk c of group g
+        pairs block_ids[c*blocks_per_chunk:(c+1)*blocks_per_chunk] with
+        the hash at flat index (c+1)*hashes_per_chunk - 1 of the shared
+        req.block_hashes stream."""
+        obj = self.obj
+        bind(obj, OFF+"scheduler.py", "_track_block_seen", self.env)
+        obj.config.blocks_per_chunk = 2
+        for cfg in obj.config.kv_group_configs:
+            cfg.hashes_per_chunk = 2
+        status = obj._req_status["r"]
+        hashes = [bytes([i + 1]) * 30 for i in range(6)]
+        status.req.block_hashes = hashes
+        # group 0: ids [1..24]; group 1 (kpool): [101..124];
+        # group 2 (mamba): [201..224] -- use a leading slice each.
+        status.group_states[0].block_ids = [11, 12, 13]
+        status.group_states[1].block_ids = [21, 22]
+        status.group_states[2].block_ids = [31, 32, 33, 34]
+        obj._track_block_seen(status)
+        expected = {
+            11: (self.key(2, 0), 0), 12: (self.key(2, 0), 0),
+            21: (self.key(2, 1), 1), 22: (self.key(2, 1), 1),
+            31: (self.key(2, 2), 2), 32: (self.key(2, 2), 2),
+            33: (self.key(4, 2), 2), 34: (self.key(4, 2), 2),
+        }
+        self.assertEqual(obj._seen_blocks, expected)
+        for bid in (11, 12, 13, 21, 22, 31, 32, 33, 34):
+            self.assertIn(bid, obj._block_last_seen)
+
 
 class RecoveryTests(unittest.TestCase):
     def test_unequal_groups_conservative_recompute_preserves_tokens(self):

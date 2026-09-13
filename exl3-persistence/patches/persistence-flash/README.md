@@ -2,7 +2,7 @@
 
 **Candidate, CPU/source-tested; not GPU or distributed runtime qualification.**
 
-The series is twelve commits on a public vLLM fork, one commit per patch:
+The series is thirteen commits on a public vLLM fork, one commit per patch:
 [`hughmadden/vllm` branch `persistence/writebehind-disk-kv`](https://github.com/hughmadden/vllm/tree/persistence/writebehind-disk-kv)
 on top of pinned upstream
 [`vllm@83252ea899c6538eaa0c1fb31f28a92c661bbffc`](https://github.com/vllm-project/vllm/tree/83252ea899c6538eaa0c1fb31f28a92c661bbffc)
@@ -18,7 +18,7 @@ block pool and the scheduler:
 
 | File | What the series does there |
 |---|---|
-| `vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py` | the write-behind design: eviction-driven stores via a deferred-free sink, the pressure gate, the idle-time staleness flusher, the in-RAM durable-key index, the small-prefill read gate, drained fail-soft outcomes |
+| `vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py` | the write-behind design: eviction-driven stores via a deferred-free sink, the pressure gate, the idle-time staleness flusher (pool-index ∪ request-path union population, 0014), the in-RAM durable-key index, the small-prefill read gate, drained fail-soft outcomes |
 | `.../offloading/worker.py`, `.../offloading/common.py`, `.../offloading_connector.py` | failure frontiers and all-rank drained-outcome reduction |
 | `vllm/v1/kv_offload/base.py`, `vllm/v1/kv_offload/cpu/manager.py` | the offload ABI extensions (`can_store`, `TransferResult`, finished-store frontier) |
 | `vllm/v1/core/block_pool.py`, `vllm/v1/core/sched/scheduler.py` | the deferred-free hook and the connector's reduction point |
@@ -26,7 +26,7 @@ block pool and the scheduler:
 These are explicit build-time changes, not an import-time monkeypatch or a
 replacement connector. The commit list (sha + subject, series order) is in
 `manifest.json` under `fork.commits`; `git log 83252ea899..persistence/writebehind-disk-kv`
-on the fork shows the same twelve.
+on the fork shows the same thirteen.
 
 ## Apply and test
 

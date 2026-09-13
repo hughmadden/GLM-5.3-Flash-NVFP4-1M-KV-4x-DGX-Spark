@@ -4,7 +4,7 @@
   "fork": {
     "repo": "hughmadden/vllm",
     "branch": "persistence/writebehind-disk-kv",
-    "commit": "d905ac40dbaad2bcf9e86599c2d309ca9299c4e6",
+    "commit": "a317836f38b013d578a4473be84a81bc09a48b89",
     "commits": [
       {
         "sha": "22fc8f3c936d240e52beb1c4d3d70f9fade5fa11",
@@ -53,6 +53,10 @@
       {
         "sha": "d905ac40dbaad2bcf9e86599c2d309ca9299c4e6",
         "subject": "kv_offload: remove the retired eager (request-path) store code; evict_only is the only store path"
+      },
+      {
+        "sha": "a317836f38b013d578a4473be84a81bc09a48b89",
+        "subject": "kv_offload: idle-flush mamba-scan union: the staleness scan populates from the pool hash index UNION request-path block identities (_seen_blocks), so mamba/KDA groups can become durable; non-cacheable (kpool) groups excluded per the 0008 guard"
       }
     ]
   },
@@ -87,7 +91,7 @@
     },
     "vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py": {
       "before": "f6b4bbde339e4ffa0507392c22af66c5f0ca8266f0980ff2965cd5eeaab525f2",
-      "after": "42fac83c321192fa037adb4be78657a00c597ba5083ad28424319858dbc2018e",
+      "after": "0b91e10b30f78869cb13f8db8f4883e511504bda2c47530f8ae83591e9de5e87",
       "anchors": [
         "class TransferJobStatus:"
       ]
