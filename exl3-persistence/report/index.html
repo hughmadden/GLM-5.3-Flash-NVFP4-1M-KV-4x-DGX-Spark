@@ -91,10 +91,12 @@
       <b>200k-token session</b> (200,448 tokens served) versus 112 s cold — 37×; a
       flood-evicted 9k session restores from disk in <b>1.42 s</b> versus ~14.8 s
       recompute (10×), 341 MB from NVMe</div></div>
-    <div class="stat"><div class="v">~6.9M tokens</div><div class="l">total addressable
-      KV cache with the Spark disk tier: 3.39M tokens GPU (43.2 GiB) + 78.8 GB
-      replicated per rank (~3.5M token-equivalents) — old sessions swap out to disk
-      under pressure and swap back in on demand</div></div>
+    <div class="stat"><div class="v">~47M tokens</div><div class="l">total
+      <b>addressable</b> KV cache with the Spark disk tier: 3.39M tokens GPU (43.2 GiB)
+      + 1&nbsp;TB-per-rank quota (&asymp;44M token-equivalents) on NVMe. Currently
+      warm: <b>&asymp;6.9M tokens</b> (78.8&nbsp;GB occupied of the quota, 23,120
+      objects per rank) — old sessions swap out to disk under pressure and back in
+      on demand; the tier grows toward its quota with real traffic</div></div>
     <div class="stat"><div class="v">0 bytes</div><div class="l">written to disk by an
       idle engine; decode under a full flood costs 4.6% — the entire persistence tax
       curve is zero unpressured, ~5% at maximum pressure</div></div>
@@ -107,7 +109,7 @@
   <div class="tablewrap">
   <table>
     <tr><th></th><th>persistence OFF (baseline)</th><th>this deployment (write-behind ON)</th></tr>
-    <tr><td>Addressable session context</td><td>3.39M tokens (GPU pool only)</td><td class="good">~6.9M tokens (GPU + disk tier); sessions survive eviction and restarts-in-part</td></tr>
+    <tr><td>Addressable session context</td><td>3.39M tokens (GPU pool only)</td><td class="good">~47M tokens capacity (GPU + 1&nbsp;TB-per-rank disk quota); &asymp;6.9M warm today; sessions survive eviction and restarts-in-part</td></tr>
     <tr><td>Cold prefill, 64k</td><td>32.3 s (2,028 tok/s)</td><td>32.0 s (2,026 tok/s) — parity</td></tr>
     <tr><td>Decode, 64k / 256k</td><td>54.5 / 51.0 tok/s</td><td>52.5 / 44.5 tok/s — within noise except deep-context-under-pressure</td></tr>
     <tr><td>Repeated session (200k)</td><td>112 s every time</td><td class="good">3.0 s once cached; 1.42 s from disk after eviction (9k ref)</td></tr>
