@@ -1,44 +1,68 @@
-# Native offloading correctness patches — re-derived onto `83252ea89`
+# The persistence connector series — pinned to its vLLM fork branch
 
 **Candidate, CPU/source-tested; not GPU or distributed runtime qualification.**
-Pinned upstream: [`vllm@83252ea899c6538eaa0c1fb31f28a92c661bbffc`](https://github.com/vllm-project/vllm/tree/83252ea899c6538eaa0c1fb31f28a92c661bbffc)
-(main, 2026-09-09; contains GLM-5.3-Flash `glm5next`).
 
-This is the port of `patches/persistence/` (pinned to `ab666069`) onto the new
-`OffloadingSpec` / `OffloadingWorker` API. It keeps the same four contract
-groupings and the same eight-file blast radius minus one deleted file: the four
-patches now modify **seven** native files, because
-`vllm/v1/kv_offload/worker/worker.py` no longer exists upstream. They are
-explicit build-time changes, not an import-time monkeypatch or a replacement
-connector.
+The series is twelve commits on a public vLLM fork, one commit per patch:
+[`hughmadden/vllm` branch `persistence/writebehind-disk-kv`](https://github.com/hughmadden/vllm/tree/persistence/writebehind-disk-kv)
+on top of pinned upstream
+[`vllm@83252ea899c6538eaa0c1fb31f28a92c661bbffc`](https://github.com/vllm-project/vllm/tree/83252ea899c6538eaa0c1fb31f28a92c661bbffc)
+(main, 2026-09-09; contains GLM-5.3-Flash `glm5next`). **No vLLM code or diffs
+are carried in this repository.** `manifest.json` pins the fork commit, the
+upstream commit, and the BEFORE/AFTER sha256 plus a unique anchor for each of
+the eight touched files; `apply.py` fetches the eight files at the pinned fork
+commit, verifies every byte against the manifest *before* writing, and overlays
+them onto a pristine upstream tree. A hash mismatch anywhere fails closed.
+
+The eight files, all inside the v1 offload connector plus one hook each in the
+block pool and the scheduler:
+
+| File | What the series does there |
+|---|---|
+| `vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py` | the write-behind design: eviction-driven stores via a deferred-free sink, the pressure gate, the idle-time staleness flusher, the in-RAM durable-key index, the small-prefill read gate, drained fail-soft outcomes |
+| `.../offloading/worker.py`, `.../offloading/common.py`, `.../offloading_connector.py` | failure frontiers and all-rank drained-outcome reduction |
+| `vllm/v1/kv_offload/base.py`, `vllm/v1/kv_offload/cpu/manager.py` | the offload ABI extensions (`can_store`, `TransferResult`, finished-store frontier) |
+| `vllm/v1/core/block_pool.py`, `vllm/v1/core/sched/scheduler.py` | the deferred-free hook and the connector's reduction point |
+
+These are explicit build-time changes, not an import-time monkeypatch or a
+replacement connector. The commit list (sha + subject, series order) is in
+`manifest.json` under `fork.commits`; `git log 83252ea899..persistence/writebehind-disk-kv`
+on the fork shows the same twelve.
 
 ## Apply and test
 
-Use Python 3.10+ and Git with a quiescent source tree. `VLLM_SOURCE` is either
-a source root containing `vllm/` **or** the `vllm` package directory itself (the
-bare overlay layout shipped in some runtime images) — `apply.py` and
-`test_native.py` accept both and map the always-`vllm/…` manifest keys onto
-whichever it was given:
+Use Python 3.10+ with a quiescent source tree. `VLLM_SOURCE` is either a source
+root containing `vllm/` **or** the `vllm` package directory itself (the bare
+overlay layout shipped in some runtime images) — `apply.py` and `test_native.py`
+accept both and map the always-`vllm/…` manifest keys onto whichever it was given:
 
 ```sh
-python3 patches/persistence-flash/apply.py check "$VLLM_SOURCE"
+# stage the pinned fork files (hash-verified) for a hermetic build context
+python3 patches/persistence-flash/apply.py fetch "$STAGING/fork-src"
+
+python3 patches/persistence-flash/apply.py check  "$VLLM_SOURCE" --from "$STAGING/fork-src"
 python3 patches/persistence-flash/test_native.py --source-tree "$VLLM_SOURCE" -v
-python3 patches/persistence-flash/apply.py apply "$VLLM_SOURCE"
+python3 patches/persistence-flash/apply.py apply  "$VLLM_SOURCE" --from "$STAGING/fork-src"
 python3 patches/persistence-flash/apply.py verify "$VLLM_SOURCE"
-# Roll back only an unchanged patched source tree:
+# Restore the pristine upstream files onto an unchanged ported tree:
 python3 patches/persistence-flash/apply.py reverse "$VLLM_SOURCE"
 ```
 
+Without `--from`, `check`/`apply` read the files from GitHub raw at the pinned
+fork commit and `reverse` from upstream at `upstream_commit`; the hashes decide
+either way. `PERSIST_FORK_SOURCE` / `PERSIST_UPSTREAM_SOURCE` set the same
+defaults for `test_native.py` (a local fork checkout or a `fetch` output both
+work), so the suite runs offline.
+
 Tests copy only the manifest-listed files into a temporary directory and execute
 AST-extracted classes/methods against fakes. They do not import vLLM or torch.
-A **pristine** `--source-tree` has the real patches applied in the temporary
+A **pristine** `--source-tree` has the fork files overlaid in the temporary
 copy first; an **already-ported** `--source-tree` is detected by its AFTER
 hashes and used as-is. `--no-apply` runs the suite against the tree exactly as
 given, which is how the pre-fix reproduction is demonstrated.
 
 `manifest.json` records exact before/after SHA256 values, unique source anchors,
-patch ordering and patch digests. All inputs and staged results are validated
-before replacing any source file. An unexpected file or patch fails closed.
+the fork commit and its ordered commit list. All fetched bytes are validated
+before replacing any source file. An unexpected file or hash fails closed.
 Application is a build operation, not crash-atomic deployment across files;
 never patch a running installation. Build/runtime rollout and rollback must
 use separate immutable artifacts.
@@ -128,7 +152,7 @@ must fulfill the contracts above. No factory, GCD/hash geometry, model, kernel,
 DFlash lookahead, cache sizing, context limit, APC or scheduling configuration
 is changed. EAGLE-family flags still come from native runtime group metadata.
 
-## Port provenance — old hunk → new location
+## Port provenance — old hunk → new location (historical; the hunks are now the fork commits)
 
 Source of the classification: `notes/port-study.md` (§B, 50 hunks:
 4 ABSORBED / 44 STILL-NEEDED / 2 OBSOLETE). Line numbers below are the

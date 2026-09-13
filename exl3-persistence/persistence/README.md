@@ -4,8 +4,8 @@ CPU-tested portable storage and native-worker implementation, **not hardware
 qualification**. Supports the vLLM external offloading ABI at
 `83252ea899c6538eaa0c1fb31f28a92c661bbffc` (ported from
 `ab666069935c1f23e8ef56038b4659ac9e8f19f8`; see `../docs/BASE-DECISION.md`).
-Requires the companion native failure/cursor/HMA patches from
-`patches/persistence-flash/`: stock native workers assert on unsuccessful
+Requires the companion native failure/cursor/HMA series from the pinned vLLM
+fork branch (see `patches/persistence-flash/`): stock native workers assert on unsuccessful
 transfers. Installing this package alone does not make that runtime fail-soft.
 
 ## Scope

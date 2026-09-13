@@ -93,6 +93,17 @@ if [ "$EXT_MODE" = "prebuilt" ]; then
     log "prebuilt .so: six exl3 symbols + sm_121a present ($(stat -c %s "$SO_DST") bytes)"
 fi
 
+# --- 2c. persistence series: stage the fork files ---------------------------
+# The series is the fork branch pinned in persistence-flash/manifest.json. Stage
+# its eight files (hash-verified against the manifest) into context/fork-src/ so
+# the image build stays offline; the stamp below covers them, so a fork-commit
+# change forces a rebuild. Set PERSIST_FORK_SOURCE to a local fork checkout (a
+# root containing vllm/) to stage without network.
+rm -rf "$CONTEXT/fork-src"
+python3 "$CONTEXT/persistence-flash/apply.py" fetch "$CONTEXT/fork-src" \
+    || die "could not stage the persistence series from the fork (see persistence-flash/README.md)"
+log "staged persistence series from fork $(python3 -c "import json;d=json.load(open('$CONTEXT/fork-src/FORK.json'));print(d['repo']+'@'+d['commit'][:10])")"
+
 # --- 3. recipe stamp -------------------------------------------------------
 # Hash the context minus the giant binaries (whose identity is already pinned by
 # filename + the in-image pip freeze). A change to any script, patch or launcher

@@ -9,11 +9,18 @@ traffic**: an idle engine writes nothing, decode under a full pool costs ~5%, an
 Full measured report: https://services.turquoisebay.ai/share/glm53-exl3-writebehind/
 (source: `report/index.html` in this directory).
 
+The engine side of this work is a branch on a public vLLM fork:
+**[`hughmadden/vllm` `persistence/writebehind-disk-kv`](https://github.com/hughmadden/vllm/tree/persistence/writebehind-disk-kv)** —
+upstream `83252ea899` plus twelve commits, one per patch, all inside the v1
+KV-offload connector (plus one hook each in the block pool and scheduler). This
+repository carries no vLLM code: it pins that branch by commit and hash and holds
+everything around it (the NVMe backend package, configs, probes, tests, records).
+
 ## What this directory contains
 
 | Path | What it is |
 |---|---|
-| `patches/persistence-flash/` | The engine patch series `0001-0013` (hash-pinned `manifest.json`, `apply.py check/apply/verify`, AST suite `test_native.py`) applied to vLLM `83252ea899` at image build |
+| `patches/persistence-flash/` | The engine series **by reference**: `manifest.json` pins the fork commit + per-file sha256, `apply.py fetch/check/apply/verify` overlays the eight files onto vLLM `83252ea899` at image build, AST suite `test_native.py` (23 tests, engine-free) |
 | `persistence/recipe_persistence/` | The out-of-tree spec + store + coordinator package (bind-mounts over dist-packages; ships by rsync + process restart) |
 | `configs/` | The launch environment and fleet launcher (`PERSIST_*` knobs) |
 | `benchmark/` | Every probe used in the report (`bench_c1c6.py` the Local Inference Labs standard, `ab_matrix.py`, `probe_prefill_tax.py`, `probe_evict_refill.py`, `probe_session_restore.py`, `probe_pressure_tax.py`, `probe_200k_restore.py`) |
@@ -23,12 +30,12 @@ Full measured report: https://services.turquoisebay.ai/share/glm53-exl3-writebeh
 ## Reproduce
 
 1. **Image**: build from the repo root (`docker/`; build host needs qemu/binfmt for the
-   arm64 stages). The series applies at image build via
-   `patches/persistence-flash/apply.py`; `manifest.json` pins every patch and every
-   touched file's before/after hash.
+   arm64 stages). `build.sh` stages the series' eight files from the fork at the
+   pinned commit (`apply.py fetch`, hash-verified) and the image build overlays
+   them via `apply.py`; `manifest.json` pins the fork commit and every touched
+   file's before/after hash.
 2. **Configure** (see `configs/`): `PERSISTENCE=on`,
-   `PERSIST_STORE_MODE=evict_only` (the supported mode; eager was retired after the A/B
-   showed 11-38% prefill and 37% decode costs for no restore advantage),
+   `PERSIST_STORE_MODE=evict_only` (the only store mode),
    `PERSIST_MIN_DISK_LOOKUP_TOKENS=32768`,
    `PERSIST_EVICTION_STORE_HIGH_WATERMARK=<~20% of pool blocks>` (pressure gate; 0=off),
    `PERSIST_LOOKUP_KEYS_PER_STEP=2048` (anything smaller hangs restores).
@@ -45,7 +52,7 @@ Full measured report: https://services.turquoisebay.ai/share/glm53-exl3-writebeh
    ```
    (`ab_matrix.py` mode switches need `PERSIST_FLEET_HOST` and `PERSIST_BENCH_URL` set.)
 
-## What the patches do (one line each)
+## What the series does (one line per commit)
 
 - **0001-0004** load-path contracts: drained-outcome API, failure frontiers, grouped
   recovery ordering, finished-store frontier.
@@ -61,11 +68,8 @@ Full measured report: https://services.turquoisebay.ai/share/glm53-exl3-writebeh
 - **0012** the idle-time staleness flusher: stale APC content lands on disk during
   decode-free steps, in-place, fenced - durability without memory pressure and zero
   decode cost by construction.
-- **0013** removes the retired eager store path (the 339-line request-path walk,
-  finish-hold, partial-tail builder, frontier helpers): evict-only is now the only
-  code path.
-  decode-free steps, in-place, fenced - durability without memory pressure and zero
-  decode cost by construction.
+- **0013** removes the request-path store code (the 339-line walk, finish-hold,
+  partial-tail builder, frontier helpers): evict-only is the only code path.
 
 ## Current measured state (2026-09-13)
 

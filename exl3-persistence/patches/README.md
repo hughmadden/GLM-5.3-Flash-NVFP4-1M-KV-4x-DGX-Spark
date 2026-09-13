@@ -6,13 +6,16 @@ load-bearing order. Nothing here is a standalone installer; read this index and
 anything.
 
 The whole chain targets one upstream pin:
-`vllm@83252ea899c6538eaa0c1fb31f28a92c661bbffc`. The persistence series declares
-that pin in its own `manifest.json`; the overlay scripts re-anchor to it.
+`vllm@83252ea899c6538eaa0c1fb31f28a92c661bbffc`. The persistence series lives as
+commits on a public fork ([`hughmadden/vllm` branch `persistence/writebehind-disk-kv`](https://github.com/hughmadden/vllm/tree/persistence/writebehind-disk-kv));
+`persistence-flash/manifest.json` pins that fork commit and the upstream pin;
+the overlay scripts re-anchor to the same upstream pin.
 
 ## Order (enforced by the build)
 
-1. **`persistence-flash/` first, on a pristine tree.** `apply.py` hash-pins all
-   seven target files against `manifest.json`'s BEFORE sha256 and refuses on any
+1. **`persistence-flash/` first, on a pristine tree.** `apply.py` fetches the
+   eight series files from the fork at the pinned commit, hash-pins them against
+   `manifest.json`'s AFTER sha256 and the tree against BEFORE, and refuses on any
    mismatch. This ordering is **the single most load-bearing decision in the
    build**: `vllm/v1/core/sched/scheduler.py` is one of the seven, and two overlay
    scripts (`patch_scheduler_decode_floor`, `patch_adaptive_k`) also edit it.
@@ -25,14 +28,11 @@ that pin in its own `manifest.json`; the overlay scripts re-anchor to it.
 
 | Path | Applies to | What it is |
 |---|---|---|
-| `persistence-flash/0001-drained-outcome-api.patch` | `vllm@83252ea89` | Persistence patch 1 of 4 — drained-outcome API. |
-| `persistence-flash/0002-offloading-failure-frontiers.patch` | `vllm@83252ea89` | Patch 2 of 4 — offloading failure frontiers. |
-| `persistence-flash/0003-grouped-recovery-ordering.patch` | `vllm@83252ea89` | Patch 3 of 4 — grouped recovery ordering. |
-| `persistence-flash/0004-finished-store-frontier.patch` | `vllm@83252ea89` | Patch 4 of 4 — finished-store frontier. |
-| `persistence-flash/apply.py` | — | Guarded applier: hash-pinned BEFORE/AFTER anchors, refuses on drift, `check`/`apply`/`verify` subcommands. |
-| `persistence-flash/manifest.json` | — | Per-file BEFORE hashes and the pinned `upstream_commit`. |
+| `persistence-flash/` | `vllm@83252ea89` | The persistence connector series, **by reference**: twelve commits on [`hughmadden/vllm` `persistence/writebehind-disk-kv`](https://github.com/hughmadden/vllm/tree/persistence/writebehind-disk-kv). No diffs are vendored here. |
+| `persistence-flash/apply.py` | — | Guarded overlay: fetches the eight files at the pinned fork commit, verifies BEFORE/AFTER sha256 + anchors, refuses on drift; `fetch`/`check`/`apply`/`verify`/`reverse`. |
+| `persistence-flash/manifest.json` | — | The pinned `upstream_commit`, the fork repo/branch/commit and its ordered commit list, and per-file BEFORE/AFTER hashes + anchors. |
 | `persistence-flash/test_native.py` | — | The re-pointed native contract suite (AST-extraction; no vLLM import needed). Proves the patches are load-bearing: it passes against the ported tree and fails against pristine. |
-| `persistence-flash/README.md` | — | The series' own description of the four contracts. |
+| `persistence-flash/README.md` | — | The series' description: files touched, contracts, apply/test flow. |
 | `vllm/patch_offloading_ambient_config.py` | `vllm@83252ea89` | **Required.** Wraps offloading-spec construction in `with set_current_vllm_config(vllm_config)`. Fail-closed: target file must hash to BEFORE, both anchors must appear exactly once, result must hash to AFTER, re-run is a no-op. Without it the scheduler path raises `ValueError: persistence requires an active vLLM cache configuration`. |
 | `vllm/patch_nope_sm120.py` | `vllm@83252ea89` | NoPE-MLA handling for SM12x (zero-pad into the 576-wide `FLASHINFER_MLA_SPARSE_SM120` record; upstream still carries the `pe_dim==64` assert class of failure). |
 | `vllm/patch_register_exl3_quant.py` | `vllm@83252ea89` | Registers the EXL3 quantization method. |
@@ -55,10 +55,10 @@ behaviour, not a defect to work around.
 
 ```sh
 # persistence series: hash-pinned check only, changes nothing
-python3 persistence-flash/apply.py check
+python3 persistence-flash/apply.py check "$VLLM_SOURCE"
 
-# native contract suite against a ported tree (40 tests, AST-extraction)
-python3 persistence-flash/test_native.py
+# native contract suite against a pristine or ported tree (23 tests, AST-extraction)
+python3 persistence-flash/test_native.py --source-tree "$VLLM_SOURCE"
 
 # overlay static checks (no torch, no CUDA)
 python3 verify/verify_overlay_static.py

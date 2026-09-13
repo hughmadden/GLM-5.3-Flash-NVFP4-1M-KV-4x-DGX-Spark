@@ -1,7 +1,7 @@
 # configs/build/ — the end-state ARM64 image recipe
 
 The image that carries everything in this release: upstream vLLM at the pin, the
-four-patch persistence series, the `recipe_persistence` package, the EXL3
+persistence connector series (from its fork branch, by pinned commit), the `recipe_persistence` package, the EXL3
 overlay and kernels, the startup observer, the launch files and the chat
 template, built as one ARM64 artifact for the four GB10 nodes.
 
@@ -37,6 +37,7 @@ that context under a top-level engineering layout (`configs/`, `patches/`,
 | `context/overlay/` | `patches/overlay/` |
 | `context/patches/` | `patches/vllm/` |
 | `context/persistence-flash/` | `patches/persistence-flash/` |
+| `context/fork-src/` | **Staged by `build.sh`**, not distributed: the eight series files fetched from the vLLM fork at the commit pinned in `patches/persistence-flash/manifest.json`, hash-verified at staging (`apply.py fetch`). |
 | `context/persistence-pkg/` | `persistence/`, with `tests/` placed inside it as `tests/` |
 | `context/tests/` | `patches/tests/` |
 | `context/verify/` | `patches/verify/` |

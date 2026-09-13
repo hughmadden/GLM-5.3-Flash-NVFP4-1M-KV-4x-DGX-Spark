@@ -838,7 +838,7 @@ class _Manager:
                         len(selected), len(skipped), groups)
         # skipped_keys is a required companion-core extension, not an upstream
         # field at 83252ea89 either. Unpatched core is not a safe supported
-        # configuration; patches/persistence-flash/0001 adds it.
+        # configuration; series commit 0001 (drained-outcome API) on the fork adds it.
         return self.output_cls(keys_to_store=selected,
                                store_spec=self.disk_cls(tuple(selected), tuple(tickets),
                                                         self.namespace, req_context.req_id),

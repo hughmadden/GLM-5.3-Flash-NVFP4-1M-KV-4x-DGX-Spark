@@ -3,11 +3,13 @@
 
 Pass --source-tree containing pinned vllm/, or the ``vllm`` package directory
 itself (the bare overlay layout). Only manifest-listed files are copied into a
-temporary tree. A pristine tree has the real patches applied there; an
+temporary tree. A pristine tree has the series overlaid there from the fork
+branch pinned in manifest.json (apply.py; set PERSIST_FORK_SOURCE /
+PERSIST_UPSTREAM_SOURCE to local vllm/... directories to run offline); an
 already-ported tree is used as-is. --no-apply runs the suite against the tree
 exactly as given, which is how the pre-fix reproduction (every contract failing
 on pristine source) is demonstrated.
-No torch, vLLM import, network, CUDA, deployment configuration or model needed.
+No torch, vLLM import, CUDA, deployment configuration or model needed.
 """
 from __future__ import annotations
 
@@ -793,19 +795,29 @@ class FinishedFrontierTests(unittest.TestCase):
         return output
 
 class PackagingTests(unittest.TestCase):
-    def test_series_patches_never_rename_or_drop_module_classes(self):
+    def test_series_never_renames_or_drops_module_classes(self):
         """Regression guard (2026-09-12): a generated patch once carried a
         class-rename hunk (-class A / +class B) from a contaminated build
         tree. apply.py validated it against the same contaminated tree, the
         AST suite passed (it binds methods, not the class), and the live
-        engine died on ImportError. No series patch may add or remove a
-        top-level class/def line."""
-        root = Path(patcher.__file__).parent
-        for entry in patcher.manifest()["patches"]:
-            text = (root / entry["file"]).read_text()
+        engine died on ImportError. The series may not add or remove a
+        top-level or nested class/def line: the fork's files must declare
+        exactly the classes and defs the pristine upstream files declare."""
+        spec = patcher.manifest()
+        before = patcher.fetch_state(spec, "before")
+        after = patcher.fetch_state(spec, "after")
+
+        def names(text):
+            out = []
             for line in text.splitlines():
-                if line.startswith(("+class ", "-class ", "+    class ", "-    class ")):
-                    self.fail(f"{entry['file']}: class-rename hunk: {line!r}")
+                stripped = line.lstrip()
+                if stripped.startswith("class "):
+                    out.append((len(line) - len(stripped), "class", stripped[6:].split("(")[0].split(":")[0].strip()))
+            return sorted(out)
+
+        for name in spec["files"]:
+            self.assertEqual(names(before[name].decode()), names(after[name].decode()),
+                             f"{name}: class set differs between upstream and fork")
 
     def test_pristine_reproduction_and_apply_verify_reverse(self):
         with tempfile.TemporaryDirectory() as directory:

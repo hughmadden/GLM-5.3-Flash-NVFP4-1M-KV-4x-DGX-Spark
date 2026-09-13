@@ -11,7 +11,6 @@ from benchmarks that violated them.
 | `bench_robust.py` | The statistical upgrade: N waves per level, mean ± stdev and 95 % CI, per-request streaming TTFT + TPOT + decode tok/s, P50/P90/max wall, a mixed code/reasoning/prose prompt set (acceptance varies by type), and **interleaved level order** to decorrelate thermal and scheduler drift. |
 | `probe_evict_refill.py` | The persistence tier's eviction/refill behaviour. The disk tier's own 1 TB quota is unreachable at test scale, so the reachable and interesting direction is forced: warm a target prompt, flood the engine with unique long prompts to push the target out of the GPU KV pool (~3.4 M tokens at this configuration), then re-request it and classify the serve path (GPU cache / disk tier / full recompute) from TTFT and the `kv_offload` + prefix-cache counters. |
 | `run_lil_c1c6.sh` | Wrapper for the Local Inference Lab standard C1..C6 decode bench: captures verbatim bench output, the persistence/offload metric deltas that frame it, and a quantified record of any ambient (non-bench) traffic that shared the engine during the run. |
-| `vllm-ref/offload-modules.txt` | Reference listing of the pinned vLLM offloading modules (paths + file contents) used when porting the persistence ABI. Not executable. |
 
 ## Usage
 

@@ -1,55 +1,61 @@
 {
   "upstream_commit": "83252ea899c6538eaa0c1fb31f28a92c661bbffc",
-  "patches": [
-    {
-      "file": "0001-drained-outcome-api.patch",
-      "sha256": "70d7c94e2c454b8c39378de37b2a43dbcd8a41327c25e21bff3570ce7f9e2ea6"
-    },
-    {
-      "file": "0002-offloading-failure-frontiers.patch",
-      "sha256": "86179342eb0741e4637e5fbf56cadf66b094ef9f94a4b616231e93721da58d46"
-    },
-    {
-      "file": "0003-grouped-recovery-ordering.patch",
-      "sha256": "cd9ca29ab28f3dc3f1d21c45a253d61200dcc9e95c22010e2e230a961713177f"
-    },
-    {
-      "file": "0004-finished-store-frontier.patch",
-      "sha256": "63dc7935020c4c4264d338babe1b926aa771bcb9ec1a44937a378658240322a5"
-    },
-    {
-      "file": "0005-store-frontier-pending-keys.patch",
-      "sha256": "b1edc591c0cc83c0e788fb741a3a919aa36e4be3aa5c30ea95dbcf4af9caf9c0"
-    },
-    {
-      "file": "0006-finish-drain-liveness-bound.patch",
-      "sha256": "de74be2054259dbd482852e2671fe8837e1fdf97a752a7bc66afae4dd031bf1e"
-    },
-    {
-      "file": "0007-finish-partial-chunk.patch",
-      "sha256": "3c637af29f3501ffa218738df878f75799f1c103fa87c8cbe9a3e73fbeb61ad8"
-    },
-    {
-      "file": "0008-noncacheable-groups-excluded.patch",
-      "sha256": "26eb1eeae501fe95af0889f2d9e429d97cf98249d783e820542b729e8258e3ee"
-    },
-    {
-      "file": "0009-writebehind-evict-only.patch",
-      "sha256": "a825d4b3d28ba358cfcfb75685108822b22b7c68b7c5f0a263a605fee1babd6e"
-    },
-    {
-      "file": "0011-pressure-gated-writebehind.patch",
-      "sha256": "ead24ed21fb8c920f4b036c0e43b2984c4b5f37b5931f24a5595878040f7b993"
-    },
-    {
-      "file": "0012-idle-staleness-flush.patch",
-      "sha256": "811f70d76ad938c946c090700b868aac1346e91c4cc00dcd2b68393b0ceb96c2"
-    },
-    {
-      "file": "0013-remove-eager-code.patch",
-      "sha256": "4993300ed3d3a4e6198a43bed79272fefba29e3f707113def248c9eabcd398c5"
-    }
-  ],
+  "upstream_repo": "vllm-project/vllm",
+  "fork": {
+    "repo": "hughmadden/vllm",
+    "branch": "persistence/writebehind-disk-kv",
+    "commit": "d905ac40dbaad2bcf9e86599c2d309ca9299c4e6",
+    "commits": [
+      {
+        "sha": "22fc8f3c936d240e52beb1c4d3d70f9fade5fa11",
+        "subject": "kv_offload: drained-outcome API: failed submissions are waited and drained before a synthetic failure; a TransferResult certifies no later buffer access"
+      },
+      {
+        "sha": "26b64df863690a62c5f5ae19728b563c8e778634",
+        "subject": "kv_offload: offloading failure frontiers: worker metadata aggregates completion counts, failure vetoes and failed-load block ids across ranks"
+      },
+      {
+        "sha": "12b5a90b01e14d42df923c2a2ca2b5302fc7553e",
+        "subject": "kv_offload: grouped recovery ordering: connectors reduce drained all-rank outcomes before the scheduler treats a step as errored"
+      },
+      {
+        "sha": "50eb75cbcc5d83facfcfc5b1b2493e6b62e8f61f",
+        "subject": "kv_offload: finished-store frontier: can_store() contract and the finished-request store frontier"
+      },
+      {
+        "sha": "f619be016d72caadfa3173484c0dfdf846a1ea98",
+        "subject": "kv_offload: store frontier walks pending keys (the tier actually serves: offered keys are the pending frontier, not the whole prefix)"
+      },
+      {
+        "sha": "5db2409eb690373a0dd34d8b4d383c7a5ba7ce11",
+        "subject": "kv_offload: finish-drain liveness bound: a held finished request must make progress or be released"
+      },
+      {
+        "sha": "4682758c880b5aa386a20a65df281c5f035e9f36",
+        "subject": "kv_offload: finished partial-chunk store: the trailing partial chunk of a finished request is storable"
+      },
+      {
+        "sha": "e3d947f7cfba5bfdbc5feb8289b13ed30803bdac",
+        "subject": "kv_offload: non-cacheable groups excluded from store eligibility (kpool tail specs are not prefix-cacheable)"
+      },
+      {
+        "sha": "989b126d3fd5922badd065f9c25b162e3c5293ee",
+        "subject": "kv_offload: write-behind evict-only store mode: stores are driven by GPU prefix-cache evictions through a deferred-free sink, demand-aware under allocation pressure; small-prefill read gate"
+      },
+      {
+        "sha": "bfe06dea733b83c952d8ef7c38c5f821f855b36d",
+        "subject": "kv_offload: pressure-gated write-behind: eviction_store_high_watermark makes an unpressured pool write nothing"
+      },
+      {
+        "sha": "03dcac1f33489e4a5dc245f218577a6808616b55",
+        "subject": "kv_offload: idle-time staleness flusher: stale APC blocks are copied in place, fenced, on decode-free steps only"
+      },
+      {
+        "sha": "d905ac40dbaad2bcf9e86599c2d309ca9299c4e6",
+        "subject": "kv_offload: remove the retired eager (request-path) store code; evict_only is the only store path"
+      }
+    ]
+  },
   "files": {
     "vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py": {
       "before": "9b3f042c6fa1581d10e8f688d2d9bc927bb41b780a9ea01f514d57228e20c978",

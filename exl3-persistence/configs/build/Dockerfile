@@ -371,7 +371,9 @@ FROM osbase
 # every later RUN) is unchanged.
 #
 # vLLM commit: the wheel's own version string; matches port/vllm-83252ea89.COMMIT
-# and persistence-flash/manifest.json "upstream_commit".
+# and persistence-flash/manifest.json "upstream_commit". The persistence series
+# itself is the fork branch pinned in that manifest ("fork.commit"); build.sh
+# stages its eight files into context/fork-src/ before the build.
 ARG VLLM_COMMIT=83252ea899c6538eaa0c1fb31f28a92c661bbffc
 # exllamav3: Mia's Dockerfile ARG EXLLAMAV3_COMMIT, unchanged since her day-0 pin
 # (notes/upstream-repo.md §2). Resolves to exllamav3 0.0.43 -- the same version
@@ -518,10 +520,13 @@ RUN set -eux; \
 # ---------------------------------------------------------------------------
 # Layer 3: PERSISTENCE -- FIRST, on the pristine tree.
 #
-# apply.py hash-pins all seven files against manifest.json's BEFORE sha256 and
-# refuses on any mismatch, so it must see upstream 83252ea89 untouched. It also
-# re-checks BEFORE hashes after staging (concurrent-modification guard) and
-# rolls every file back on failure.
+# The series is not carried as diffs: apply.py overlays the eight files from
+# context/fork-src/ (staged by build.sh from the fork at manifest.json's pinned
+# commit, hash-verified at staging) onto the wheel's tree. It hash-pins the tree
+# against manifest.json's BEFORE sha256 and every staged file against AFTER, and
+# refuses on any mismatch, so it must see upstream 83252ea89 untouched. It
+# re-checks BEFORE hashes immediately before writing (concurrent-modification
+# guard) and rolls every file back on failure. No network is used here.
 #
 # NOTE, UNVERIFIED: those BEFORE hashes were computed from the *git* tree
 # (pinned-vllm). This layer is the first thing that proves the nightly *wheel*
@@ -529,10 +534,13 @@ RUN set -eux; \
 # force it; re-derive the manifest against the wheel.
 # ---------------------------------------------------------------------------
 COPY context/persistence-flash/ /opt/glm53/persistence-flash/
+COPY context/fork-src/ /opt/glm53/fork-src/
 RUN set -eux; \
-    python3 /opt/glm53/persistence-flash/apply.py check "${SITE}/vllm"; \
-    python3 /opt/glm53/persistence-flash/apply.py apply "${SITE}/vllm"; \
-    python3 /opt/glm53/persistence-flash/apply.py verify "${SITE}/vllm"
+    test -f /opt/glm53/fork-src/FORK.json; \
+    python3 /opt/glm53/persistence-flash/apply.py check  "${SITE}/vllm" --from /opt/glm53/fork-src; \
+    python3 /opt/glm53/persistence-flash/apply.py apply  "${SITE}/vllm" --from /opt/glm53/fork-src; \
+    python3 /opt/glm53/persistence-flash/apply.py verify "${SITE}/vllm"; \
+    cp /opt/glm53/fork-src/FORK.json /opt/receipts/persistence-fork.json
 
 # The connector implementation itself. --no-deps: it deliberately imports
 # neither torch nor vLLM at import time, and pulling its build deps would risk

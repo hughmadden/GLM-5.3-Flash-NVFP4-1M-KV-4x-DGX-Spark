@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>No-tax disk persistence for GLM-5.3-Flash: write-behind KV cache on 4× DGX Spark</title>
+<title>A write-behind disk tier for vLLM's KV-offload connector: session persistence for GLM-5.3-Flash on four DGX Sparks</title>
 <style>
   :root { --bg:#f7f8fa; --card:#fff; --ink:#1a2330; --muted:#5b6878;
           --accent:#0d7a8a; --accent2:#b3541e; --line:#dde3ea; --chip:#e8f4f6;
@@ -49,23 +49,35 @@
           padding:8px 14px; margin:12px 0; border-radius:0 6px 6px 0; }
   a { color:var(--accent); }
   footer { color:var(--muted); font-size:0.82rem; margin-top:28px; text-align:center; }
+  /* tier diagram */
+  .tiers { display:grid; grid-template-columns:1fr auto 1fr auto 1fr; gap:10px; align-items:stretch; margin:16px 0 6px; }
+  .tier { border:1px solid var(--line); border-radius:8px; padding:12px 14px; background:var(--bg); }
+  .tier b { display:block; margin-bottom:4px; }
+  .tier .cap { color:var(--accent); font-weight:700; font-size:1.1rem; }
+  .tier .d { color:var(--muted); font-size:0.84rem; }
+  .arrow { display:flex; flex-direction:column; justify-content:center; align-items:center;
+           color:var(--muted); font-size:0.78rem; text-align:center; min-width:96px; }
+  .arrow .a { font-size:1.4rem; color:var(--accent2); line-height:1; }
+  @media (max-width:720px) { .tiers { grid-template-columns:1fr; } .arrow { min-width:0; } }
 </style>
 </head>
 <body>
 <div class="wrap">
 
 <header>
-  <h1>No-tax disk persistence for GLM-5.3-Flash</h1>
-  <div class="sub">A write-behind KV cache on four DGX Spark nodes: the disk tier adds millions of
-  tokens of session context while business-as-usual latency stays indistinguishable from
-  persistence off. What we built, what it measures, and the five design decisions that made it
-  no-tax.</div>
+  <h1>A write-behind disk tier for vLLM's KV-offload connector</h1>
+  <div class="sub">An enhancement to vLLM's v1 offloading connector, plus a node-local NVMe
+  backend for it, running GLM-5.3-Flash on four DGX Sparks. Long-running agent sessions survive
+  eviction and come back in seconds instead of minutes of prefill, from a disk tier an order of
+  magnitude larger than GPU memory. The tier costs nothing while the engine is idle or
+  unpressured, and about five percent of decode only while the cache is full and evicting.
+  That five percent buys back the most expensive work the server does.</div>
   <div class="chips">
     <span class="chip">GLM-5.3-Flash 320B MoE</span>
     <span class="chip">EXL3 TR3 4bpw</span>
     <span class="chip">4× DGX Spark (GB10)</span>
     <span class="chip">vLLM TP4 · DFlash2 k=7 · fp8 KV</span>
-    <span class="chip">write-behind disk KV tier</span>
+    <span class="chip">vLLM KV-offload connector + NVMe backend</span>
     <span class="chip">2026-09-13</span>
   </div>
 </header>
@@ -73,178 +85,264 @@
 <section>
   <h2>Headlines</h2>
   <div class="grid">
+    <div class="stat"><div class="v">3.0 s vs 112 s</div>
+      <div class="l"><b>A 200k-token session, rehydrated instead of re-prefilled.</b>
+      200,448 of 204,668 tokens served from cache (37×). From the disk tier itself: an evicted
+      9k session returns in <b>1.42 s</b> (341 MB from NVMe), and 423,936 tokens were restored
+      from disk mid-request inside a live 800k prefill.</div></div>
     <div class="stat"><div class="v">~47M tokens</div>
-      <div class="l"><b>Total addressable KV cache.</b> 3.39M tokens in GPU (43.2 GiB UMA pool)
-      + a 1&nbsp;TB-per-rank NVMe quota (&asymp;44M token-equivalents at fp8). Currently warm:
-      &asymp;6.9M tokens (78.8&nbsp;GB occupied, 23,120 objects per rank) — old sessions swap out
-      to disk under memory pressure and swap back in on demand. The store has been tested to
-      78.8&nbsp;GB; its internal eviction watermarks (800&nbsp;GB–1&nbsp;TB) are untested at scale.</div></div>
-    <div class="stat"><div class="v">3.0 s</div>
-      <div class="l"><b>200k-session retrieval from cache</b> (200,448 of 204,668 tokens served)
-      versus <b>112 s cold</b> — 37×. Disk-tier restore, measured at the sizes that converge:
-      an evicted 9k session returns in <b>1.42 s</b> (341 MB from NVMe) versus ~15 s recompute,
-      and 423,936 tokens restored from disk mid-request inside a live 800k prefill. A full
-      200k-from-disk cold restore is the one open item (see §5).</div></div>
-    <div class="stat"><div class="v">0 → ~5%</div>
-      <div class="l"><b>The entire persistence tax curve.</b> An idle engine writes zero bytes
-      (census-verified), so unpressurized decode is untouched; under a full pool with copies
-      draining, decode measures −4.6%. Cold prefill at 64k matches persistence-off within
-      measurement noise (2,026 vs 2,028 tok/s).</div></div>
+      <div class="l"><b>Addressable session context.</b> 3.39M tokens in GPU memory (43.2 GiB
+      unified-memory pool) plus a 1 TB-per-rank NVMe quota, roughly 44M token-equivalents at
+      fp8. Warm today: about 6.9M tokens (78.8 GB, 23,120 objects per rank). Old sessions
+      swap out under pressure and swap back on demand.</div></div>
+    <div class="stat"><div class="v">0% → ~5%</div>
+      <div class="l"><b>The whole cost curve.</b> An idle engine writes zero bytes
+      (census-verified), so unpressured prefill and decode are untouched. With the pool full
+      and copies draining, decode measures −4.6%. Cold 64k prefill matches persistence-off
+      within noise (2,026 vs 2,028 tok/s).</div></div>
   </div>
 </section>
 
 <section>
   <h2>1 · What this is</h2>
-  <p>GLM-5.3-Flash (320B MoE) in EXL3 TR3 4bpw, tensor-parallel across four DGX Spark nodes
-  (GB10, 121.7 GiB unified memory each), vLLM <code>0.28.1rc1.dev617</code> on a pinned upstream
-  commit (<code>83252ea899</code>) plus a twelve-patch persistence series, DFlash2 speculative
-  decoding at k=7, <code>--enforce-eager</code>, fp8 KV, <code>MAX_NUM_SEQS=4</code>. The disk
-  tier is per-rank NVMe with a sqlite index and per-rank coordinators. The serving
-  configuration is unchanged from the published TP4 playbook; everything described here is
-  additive.</p>
-</section>
-
-<section>
-  <h2>2 · No disk vs this deployment</h2>
+  <p>vLLM's v1 KV-offload connector ships with a CPU tier: blocks are copied out of GPU memory
+  on the request path and looked up on the next request. This work extends that connector in
+  two layers, and the split matters for anyone who wants to reuse it:</p>
+  <ul>
+    <li><b>In the engine: write-behind semantics for the connector.</b> Twelve patches
+    against upstream vLLM at commit <code>83252ea899</code>, 705 lines added and 480 removed
+    across eight files, almost all inside <code>kv_connector/v1/offloading/</code> and
+    <code>v1/kv_offload/</code>, with one hook each in the block pool and the scheduler.
+    They add: stores driven by prefix-cache eviction instead of by requests, a pressure gate
+    so an idle engine writes nothing, an idle-time flusher for stale content, an in-memory
+    durable-key index so misses are free, and drained fail-soft outcomes so a failed transfer
+    becomes a cache miss rather than an assertion. Nothing here is disk-specific.</li>
+    <li><b>Out of tree: a node-local NVMe backend.</b> The <code>recipe_persistence</code>
+    package (about 4,800 lines) implements the connector's <code>OffloadingSpec</code> for
+    per-rank local disk: an immutable checksummed object store with a bounded sqlite index,
+    per-rank coordinators with an authenticated metadata endpoint, and the geometry and
+    transfer handlers. It installs over dist-packages and ships by rsync plus restart, with
+    no engine rebuild.</li>
+  </ul>
+  <p>Configuration is a handful of <code>PERSIST_*</code> environment knobs. The serving
+  configuration is otherwise the published TP4 playbook, unchanged.</p>
+  <h3>The configuration measured here</h3>
   <div class="tablewrap">
   <table>
-    <tr><th></th><th>persistence OFF</th><th>write-behind ON (this deployment)</th></tr>
-    <tr><td>Addressable session context</td><td>3.39M tokens (GPU pool only)</td>
-      <td class="good">~47M tokens capacity; ~6.9M warm today; sessions survive eviction</td></tr>
-    <tr><td>Cold prefill 64k / 256k</td><td>2,028 / 1,901 tok/s</td>
-      <td>2,026 / 1,919 tok/s — parity (the 256k cell even served 16,128 tokens from disk mid-prefill)</td></tr>
-    <tr><td>Decode 64k / 256k (C=1)</td><td>54.5 / 51.0 tok/s</td>
-      <td>52.5 / 44.5 tok/s — within run noise except deep-context under pressure</td></tr>
-    <tr><td>200k session, repeat visit</td><td>112 s every time</td>
-      <td class="good">3.0 s from cache; 1.42 s from disk at the tested sizes</td></tr>
-    <tr><td>3.6M-token flood (&gt; GPU pool)</td><td>overflow recomputes, sessions lost</td>
-      <td class="good">absorbed: 2 GB written, 4–11 declines, zero stalls; evicted sessions
-      restorable — eager mode wrote 74 GB with 228 declines for the same flood</td></tr>
-    <tr><td>Idle disk traffic</td><td>—</td>
-      <td>zero (pressure gate) + hourly stale-content flush at background rate</td></tr>
+    <tr><th>Model</th><td>GLM-5.3-Flash, 320B MoE, EXL3 TR3 4bpw (Mia-AiLab build), DFlash2 drafter at k=7</td></tr>
+    <tr><th>Hardware</th><td>4× DGX Spark (GB10), 121.7 GiB unified memory each, local NVMe per node, tensor-parallel 4</td></tr>
+    <tr><th>Engine</th><td>vLLM <code>0.28.1rc1.dev617</code> at <code>83252ea899</code> + the twelve connector patches; <code>--enforce-eager</code>, fp8 KV, <code>MAX_NUM_SEQS=4</code>, <code>max_num_batched_tokens=7168</code>, <code>max_model_len</code> 850k</td></tr>
+    <tr><th>GPU KV pool</th><td>43.2 GiB, 3.39M tokens, per rank</td></tr>
+    <tr><th>Disk tier</th><td>1 TB quota per rank on NVMe (about 44M token-equivalents at fp8); write-behind on eviction; pressure gate at about 20% of pool blocks; disk lookups only for prompts over 32k tokens; stale content flushed after 1 hour</td></tr>
   </table>
   </div>
-  <p class="muted">All cells measured with unique salted prompts, streaming TTFT, medians of
-  two reps or better; engine variance ±5–10%. Protocols and probe scripts are in the repo.</p>
+  <p><b>Why it matters most on Sparks, and why it is not Spark-specific.</b> On a DGX Spark the
+  model weights and the KV pool share one unified memory, so the pool is a fraction of what a
+  discrete-GPU box gets for the same model, eviction pressure arrives early, and every byte
+  moved on the request path competes with prefill and decode for the same memory bandwidth.
+  A write-behind design that touches nothing on the request path is therefore worth more here
+  than anywhere. But the connector changes know nothing about GB10, EXL3 or this model: they
+  apply to any model vLLM serves through the v1 offload connector, and the NVMe backend is a
+  drop-in <code>OffloadingSpec</code> for any node with local disk.</p>
+  <h3>Where the code lives</h3>
+  <div class="tablewrap">
+  <table>
+    <tr><th>Repository</th><th>What it holds</th></tr>
+    <tr><td><a href="https://github.com/hughmadden/vllm/tree/persistence/writebehind-disk-kv">hughmadden/vllm</a>,
+      branch <code>persistence/writebehind-disk-kv</code></td>
+      <td>Upstream vLLM at <code>83252ea899</code> plus the twelve engine patches, one commit
+      per patch in series order. Diff this branch against its base to see exactly what changed
+      in the connector.</td></tr>
+    <tr><td><a href="https://github.com/hughmadden/GLM-5.3-Flash-NVFP4-1M-KV-4x-DGX-Spark/tree/main/exl3-persistence">hughmadden/GLM-5.3-Flash-NVFP4-1M-KV-4x-DGX-Spark</a>,
+      <code>exl3-persistence/</code></td>
+      <td>The NVMe backend package, the fleet configs and image recipe, every probe behind the
+      numbers below, the engine-free test suites, the per-round records, and this report. It
+      carries no vLLM code: <code>patches/persistence-flash/</code> holds a manifest pinning
+      the fork commit and the sha256 of every touched file, and an applier that fetches those
+      files from the fork and overlays them onto the pinned upstream wheel at image build,
+      refusing on any hash mismatch.</td></tr>
+  </table>
+  </div>
 </section>
 
 <section>
-  <h2>3 · The five decisions that made it no-tax</h2>
-  <p>The first version of this tier stored eagerly — every new chunk written on the request
-  path, responses held for the store drain, synchronous all-rank admissions. It worked, and it
-  taxed exactly the traffic it should protect: <span class="bad">−11…−38% prefill, −37% decode
-  at 256k, 36× write amplification</span>. The no-tax property came from five decisions, each
-  taken after measurement:</p>
+  <h2>2 · Why: agents and bots hold sessions for hours</h2>
+  <p>Agentic and bot workloads look nothing like chat. A coding agent, a research loop, or a
+  monitoring bot builds a context of 100k to 400k tokens over an hour or more, goes quiet
+  while tools run or a human reads, and then comes back. On a shared engine that pause is
+  fatal to the cache: other traffic evicts the session, and the next turn pays a full prefill.
+  At 200k tokens that is 112 seconds of the server's most expensive work, repeated every
+  time the session is touched after a gap.</p>
+  <p>The GPU pool on this fleet holds 3.39M tokens, which is a handful of such sessions. The
+  disk tier changes the arithmetic in two ways:</p>
+  <ul>
+    <li><b>Rehydration skips prefill.</b> An evicted session comes back at NVMe speed. The
+    200k session above returns in 3.0 s instead of 112 s; the engine spends those seconds
+    copying bytes, not recomputing attention.</li>
+    <li><b>The cache is large enough to keep everything.</b> A 1 TB quota per rank is about
+    44M token-equivalents: hundreds of long sessions can stay warm on disk at once, so a
+    bot fleet's whole working set fits rather than a lucky few sessions.</li>
+  </ul>
+  <p>Sessions under 32k prompt tokens skip the disk tier by design. Small contexts recompute
+  faster than a disk scan costs, so short-context bots pay nothing and get nothing, and the
+  tier's budget is spent where prefill is actually expensive.</p>
+</section>
+
+<section>
+  <h2>3 · How: write behind, only under pressure</h2>
+  <p>The tier never touches the request path. The GPU prefix cache decides what is worth
+  keeping, and the disk only ever receives what the GPU is about to throw away.</p>
+  <div class="tiers">
+    <div class="tier"><b>GPU prefix cache</b><span class="cap">3.39M tokens</span>
+      <span class="d">Source of truth. Every request is served from here first; the disk is
+      consulted only past the cache boundary, and only for prompts over 32k tokens.</span></div>
+    <div class="arrow"><span class="a">→</span>on eviction only<br>background copies</div>
+    <div class="tier"><b>Deferred-free sink</b><span class="cap">held, not freed</span>
+      <span class="d">Evicted blocks are held outside the free queue while a background copy
+      drains them to disk. Under allocation pressure the sink declines new holds and hands
+      blocks back, so it can never stall the scheduler.</span></div>
+    <div class="arrow"><span class="a">→</span>NVMe, per rank<br>sqlite index</div>
+    <div class="tier"><b>Disk tier</b><span class="cap">1 TB per rank</span>
+      <span class="d">Immutable checksummed objects, one store per rank, restored on demand
+      straight back into the GPU pool. Namespace-fingerprinted to the model, quant, template
+      and layout.</span></div>
+  </div>
+  <p>Four properties make this cost nothing when it is not needed:</p>
   <ol>
-    <li><b>Stores are eviction-driven, never request-driven (patch 0009).</b> The GPU prefix
-    cache is the source of truth for what deserves durability: blocks copy to disk only when
-    the cache evicts them, through a deferred-free sink that holds blocks outside the free
-    queue while background copies drain. Nothing is offered, held, or admitted on any request
-    path — zero store bytes measured at every context size. Demand-aware holding (decline
-    and release under free-queue pressure) keeps the sink from ever stalling allocation —
-    a lesson paid for by a real flood crash.</li>
-    <li><b>Reads are RAM-first with a size gate.</b> The connector is consulted only beyond
-    the GPU cache boundary; requests under 32k prompt tokens skip the disk entirely (a small
-    RAM-miss recomputes cheaper than the scan costs). The gate keys on request size, never
-    miss size, and its skips are counted, not silent.</li>
-    <li><b>Lookup misses must be nearly free (patches 0010/0010b).</b> The remaining tax was
-    the lookup scan: per-key index reads on four ranks on the scheduler's critical path,
-    −22% prefill at 64k. An in-RAM durable-key index (authoritative for negatives, maintained
-    on every durability transition) plus in-process dispatch for the rank-local coordinator
-    leg took the residual to <b>~0%</b> (2,026 vs 2,028 tok/s OFF). Unit tests pin both: a
-    counting connection wrapper proves zero index I/O on the fast negative.</li>
-    <li><b>An idle engine writes nothing (patch 0011).</b> A free-pool watermark gates the
-    sink: above it, holds are declined. Census-verified zero bytes during a full prefill/decode
-    smoke at OFF-parity speeds; the only measured cost under a full pool is −4.6% decode while
-    copies drain. Stale-content durability moved to its own mechanism rather than weakening
-    this gate.</li>
-    <li><b>Stale content flushes in idle time, at decode-zero cost (patch 0012).</b> APC
-    blocks untouched for a configurable age (1 hour default) are written during <i>decode-free
-    steps only</i> — prefill windows and finish drains — as in-place copies fenced against
-    reuse. A decode step never pays for persistence by construction. This is what gives cold
-    sessions durability without memory pressure.</li>
+    <li><b>Writes happen on eviction, never on a request.</b> Nothing is offered, held or
+    admitted while a prompt is being served. Store bytes on the request path measure zero at
+    every context size.</li>
+    <li><b>An idle engine writes nothing.</b> A free-pool watermark gates the sink: while the
+    pool has headroom, holds are declined and no copy runs. The only measured cost, decode
+    −4.6%, appears when the pool is full and copies are draining, which is exactly the
+    situation in which sessions are being lost.</li>
+    <li><b>Stale content is flushed in idle time.</b> Cache content untouched for an hour
+    (configurable) is copied to disk during decode-free steps only, in place and fenced against
+    reuse. A decode step never pays for durability, by construction, and a long-quiet session
+    is safe on disk before anything evicts it.</li>
+    <li><b>A miss costs a set lookup, not a disk scan.</b> An in-memory index of durable keys
+    answers negatives on all four ranks without touching sqlite, so the lookup that sits on
+    the scheduler's critical path adds nothing measurable to prefill.</li>
   </ol>
-  <p>Two engineering disciplines carried the campaign: the patch series is hash-pinned
-  (before/after hashes per file, an AST suite binding the patched methods and running them
-  engine-free), and every measured claim above has a committed probe. The flood-crash and
-  fence-cleanup bugs found in bring-up were caught by that suite or its live smoke — the
-  suite is part of the design, not an afterthought.</p>
+  <div class="note"><b>Why five percent is the right price.</b> The pressure tax only exists
+  while sessions are being evicted, and each evicted long session that later returns would
+  otherwise cost a full prefill. On the measured numbers, one avoided 200k rehydration saves
+  about 109 s of prefill compute, which is the same server time as roughly 40 minutes of
+  decode at −4.6%. That is arithmetic on the measurements above, not a separate measurement,
+  but the direction is not close: the tax is paid in the moments it is cheapest and repaid
+  in the moments prefill is dearest.</div>
 </section>
 
 <section>
-  <h2>4 · Measured evidence</h2>
+  <h2>4 · Measured</h2>
 
-  <h3>4.1 Prefill and decode across modes</h3>
+  <h3>4.1 Cost on ordinary traffic: persistence off vs on</h3>
   <div class="tablewrap">
   <table>
-    <tr><th>Context</th><th class="num">C</th><th>Metric</th><th class="num">OFF</th>
-        <th class="num">eager (retired)</th><th class="num">write-behind</th></tr>
-    <tr><td>8k</td><td class="num">1</td><td>prefill tok/s</td><td class="num">1,868</td><td class="num bad">1,531</td><td class="num">1,868</td></tr>
-    <tr><td>64k</td><td class="num">1</td><td>prefill tok/s</td><td class="num">2,028</td><td class="num bad">1,531</td><td class="num good">2,026</td></tr>
-    <tr><td>256k</td><td class="num">1</td><td>prefill tok/s</td><td class="num">1,901</td><td class="num bad">1,691</td><td class="num">1,919</td></tr>
-    <tr><td>64k</td><td class="num">1</td><td>decode tok/s</td><td class="num">54.5</td><td class="num bad">46.0</td><td class="num">52.5</td></tr>
-    <tr><td>256k</td><td class="num">1</td><td>decode tok/s</td><td class="num">51.0</td><td class="num bad">32.5</td><td class="num">44.5</td></tr>
+    <tr><th>Context</th><th>Metric</th><th class="num">persistence OFF</th>
+        <th class="num">write-behind ON</th><th>Read</th></tr>
+    <tr><td>8k</td><td>prefill tok/s</td><td class="num">1,868</td><td class="num">1,868</td><td>identical; below the 32k gate the disk is never consulted</td></tr>
+    <tr><td>64k</td><td>prefill tok/s</td><td class="num">2,028</td><td class="num good">2,026</td><td>parity</td></tr>
+    <tr><td>256k</td><td>prefill tok/s</td><td class="num">1,901</td><td class="num">1,919</td><td>parity; this cell served 16,128 tokens from disk mid-prefill and still matched</td></tr>
+    <tr><td>64k</td><td>decode tok/s</td><td class="num">54.5</td><td class="num">52.5</td><td>within run noise</td></tr>
+    <tr><td>256k</td><td>decode tok/s</td><td class="num">51.0</td><td class="num">44.5</td><td>deep context with the tier live and copies draining; the one cell a longer soak should firm up</td></tr>
   </table>
   </div>
+  <p class="muted">Single-stream cells, unique salted prompts, streaming TTFT (prefill = prompt
+  tokens ÷ TTFT), 200-token outputs, median of two reps; engine variance ±5–10%. The tier was
+  live during the ON column with background eviction copies of ~159 MB per measurement window.
+  A four-stream matrix at the same sizes was measured before the pressure gate landed and
+  showed wider prefill gaps from copy backlog sharing the step quantum; it is due a re-run
+  with the gate and is not quoted here.</p>
 
-  <h3>4.2 The flood and the restore</h3>
-  <p>400 unique 9k sessions (3.6M tokens) against the 3.39M-token pool, then a re-request of
-  an early session while the engine is busy:</p>
+  <h3>4.2 The pressure gate, isolated</h3>
+  <p>With the gate active, an idle engine running an 8k + 64k smoke wrote <b>zero bytes</b>
+  (census: zero new objects) at 1,984 / 1,987 prefill tok/s and 50–51 decode tok/s, persistence-off
+  parity with nothing moving. Under a 120 × 9k flood with interleaved decode streams, decode
+  measured <b>39.1 vs 41.0 tok/s idle (−4.6%)</b>. That is the entire pressure tax. The idle
+  flusher separately lands stale content at 2–4 MB/s in the background (4.62 GB in a 36-minute
+  run), and the restore path reads those bytes back.</p>
+
+  <h3>4.3 Overflow and restore</h3>
+  <p>400 unique 9k sessions (3.6M tokens) pushed through the 3.39M-token pool, then an early
+  session re-requested while the engine was still busy:</p>
   <div class="tablewrap">
   <table>
-    <tr><th></th><th class="num">eager (retired)</th><th class="num">write-behind</th></tr>
-    <tr><td>Written during flood</td><td class="num bad">73.8 GB</td><td class="num good">2.07 GB</td></tr>
-    <tr><td>Allocation declines</td><td class="num">228</td><td class="num good">4–11</td></tr>
-    <tr><td><b>Restore of evicted 9k session</b></td><td class="num">4.15 s / 1.03 GB</td>
-        <td class="num good"><b>1.42 s / 341 MB</b></td></tr>
-    <tr><td>Engine state after</td><td>healthy</td><td class="good">healthy, zero stalls</td></tr>
+    <tr><th></th><th class="num">write-behind</th></tr>
+    <tr><td>Flood completed</td><td class="num">400 / 400, engine healthy, zero allocation stalls</td></tr>
+    <tr><td>Written to disk during the flood</td><td class="num">2.07 GB (only genuine evictions)</td></tr>
+    <tr><td>Allocation declines (sink handing blocks back)</td><td class="num">4–11</td></tr>
+    <tr><td><b>Evicted 9k session restored</b></td><td class="num good"><b>1.42 s, 341 MB, serve path: disk tier</b></td></tr>
   </table>
   </div>
+  <p>The tier stores exactly what the GPU evicted rather than whole-prompt copies, so a restore
+  transfers only the blocks that were actually lost. At 9k the recompute alternative is a few
+  seconds; the ratio grows with session size, which is why the 200k case is the one that
+  matters for agents.</p>
 
-  <h3>4.3 Standard benchmark and production smoke</h3>
+  <h3>4.4 Standard benchmark and production smoke</h3>
   <p>Local Inference Labs standard bench (C1–C6, 700-token outputs, salted prompts):
-  38.3 / 73.4 / 51.6 / 52.9 / 64.3 / 69.2 aggregate tok/s, zero failures — within variance
-  of the published no-persistence baseline; the tier does not disturb the standard bench.</p>
-  <p>Production smoke (agentic ladder, 300-token outputs): 32k → 15.4s TTFT, 2,030 prefill
-  tok/s; 128k → 66.6s, 2,008; 256k → 141s, 1,897; <b>400k (404,745 tokens, the largest
-  single request this fleet has served) → 261s, 1,549 tok/s, decode healthy</b>; a 4×32k
-  concurrent burst ran clean at 393–1,396 prefill tok/s per stream. The configured
-  <code>max_model_len</code> of 850k is refused at admission in 1.1s — the practical
-  single-request ceiling is ~405k tokens, set by unified memory, independent of
-  persistence; whether the baseline playbook shares that wall has not been measured and
-  should be (same ladder, persistence off).</p>
+  38.3 / 73.4 / 51.6 / 52.9 / 64.3 / 69.2 aggregate tok/s, zero failures, within variance of
+  the published no-persistence baseline.</p>
+  <p>Agentic ladder, 300-token outputs, tier live: 32k → 15.4 s TTFT at 2,030 prefill tok/s;
+  128k → 66.6 s, 2,008; 256k → 141 s, 1,897; <b>400k (404,745 tokens, the largest single
+  request this fleet has served) → 261 s, 1,549 tok/s, decode healthy</b>. A 4 × 32k concurrent
+  burst ran clean. The practical single-request ceiling is about 405k tokens; the configured
+  850k maximum is refused at admission in 1.1 s. We believe that ceiling is a property of this
+  serving recipe on unified memory (weights, drafter and pool sharing 121.7 GiB per node), not
+  of the offload connector: the connector adds no per-request memory. The same ladder with
+  persistence off has not been run to confirm it, and should be.</p>
 </section>
 
 <section>
-  <h2>5 · Open item, stated plainly</h2>
-  <p><b>Full cold restore of large sessions from disk.</b> Disk restore is proven at 9k
-  (1.42 s) and as a 423,936-token partial inside a live 800k prefill, and cache retrieval
-  is proven at 200k (3.0 s). A complete 200k+ session restored cold from disk after a
-  restart recomputes today: the lookup traces show the earliest chunks absent, and the
-  census shows why — under a heavy flood the bounded capture window (4,096 held blocks,
-  8 keys/step drain) lands gigabytes, not the whole evicted set, and the mamba groups'
-  chunks are visible to the store but not to the flusher's scan population. The dials
-  exist (<code>eviction_hold_cap</code>, <code>eviction_store_per_step</code>,
-  <code>idle_flush_per_scan</code>) and the mechanism is proven in both directions; whole-
-  session coverage at flood scale is engineering, not architecture. Until it lands, quote
-  disk restore at the tested sizes.</p>
+  <h2>5 · Limits, stated plainly</h2>
+  <ul>
+    <li><b>Cold restore of a large session after a restart is not yet whole.</b> Disk restore
+    is proven at 9k (1.42 s) and as a 423,936-token partial inside a live 800k prefill; cache
+    retrieval is proven at 200k (3.0 s). A complete 200k+ session restored cold from disk
+    after a restart still recomputes today: under a heavy flood the bounded capture window
+    (4,096 held blocks, 8 keys per step) lands gigabytes rather than the whole evicted set.
+    The dials exist (<code>eviction_hold_cap</code>, <code>eviction_store_per_step</code>,
+    <code>idle_flush_per_scan</code>) and both directions of the mechanism are proven; whole-
+    session coverage at flood scale is engineering, not architecture. Until it lands, quote
+    disk restore at the tested sizes.</li>
+    <li><b>The store is tested to 78.8 GB per rank.</b> Its eviction watermarks near the
+    1 TB quota have not been exercised at scale.</li>
+    <li><b>Sessions under 32k tokens are never persisted.</b> This is deliberate, and the gate
+    is a single knob if a workload wants it lower.</li>
+    <li><b>The ~405k single-request ceiling</b> is attributed to the recipe on unified memory,
+    not to the connector, on reasoning rather than a persistence-off measurement of the same
+    ladder.</li>
+    <li><b>Deep-context decode under pressure</b> (256k, −13%) is the one cell in §4.1 that a
+    longer soak should firm up before it is quoted as settled.</li>
+  </ul>
 </section>
 
 <section>
-  <h2>6 · Reproduce</h2>
-  <pre># engine: vLLM 83252ea899 + patches/persistence-flash/0001..0013 (hash-pinned manifest;
-# AST suite test_native.py, 23 tests, runs engine-free)
-# package: persistence/recipe_persistence (bind-mount overlay)
-# configs: PERSISTENCE=on  PERSIST_STORE_MODE=evict_only
-#   PERSIST_MIN_DISK_LOOKUP_TOKENS=32768  PERSIST_LOOKUP_KEYS_PER_STEP=2048
-#   PERSIST_EVICTION_STORE_HIGH_WATERMARK=&lt;~20% pool blocks&gt;   # pressure gate
-#   PERSIST_IDLE_FLUSH_STALE_SECONDS=3600 / _PER_SCAN=32 / _SCAN_SECONDS=5
+  <h2>6 · Deployment</h2>
+  <p>The full configuration is the table in §1; the environment below is what the fleet
+  launcher sets for the tier. The serving side is the published TP4 playbook, unchanged.</p>
+  <pre># engine:  hughmadden/vllm branch persistence/writebehind-disk-kv
+#          (= upstream 83252ea899 + 12 commits, one per patch). The image build
+#          overlays those files onto the upstream wheel via
+#          patches/persistence-flash/apply.py (manifest-pinned fork commit +
+#          per-file sha256); test_native.py is the engine-free AST suite.
+# backend: persistence/recipe_persistence (bind-mount overlay over dist-packages)
+PERSISTENCE=on
+PERSIST_STORE_MODE=evict_only                 # write-behind: stores only on eviction
+PERSIST_MIN_DISK_LOOKUP_TOKENS=32768          # prompts under 32k never consult disk
+PERSIST_LOOKUP_KEYS_PER_STEP=2048
+PERSIST_EVICTION_STORE_HIGH_WATERMARK=&lt;~20% of pool blocks&gt;   # pressure gate; 0 = off
+PERSIST_IDLE_FLUSH_STALE_SECONDS=3600         # stale content flushed in decode-free steps
+PERSIST_IDLE_FLUSH_PER_SCAN=32
+PERSIST_IDLE_FLUSH_SCAN_SECONDS=5
+CACHE_FINGERPRINT=&lt;pinned&gt;                    # changing it re-namespaces the tier
 # measure:
 python3 benchmark/bench_c1c6.py --url http://&lt;head&gt;:8888 --model &lt;name&gt; --rounds 3
 python3 benchmark/ab_matrix.py --modes off,evict --sizes 8192,65536,262144 --conc 1,4
-python3 benchmark/probe_evict_refill.py --n 400 --tokens 9000 --settle 45</pre>
-  <p class="muted">Public lane: github.com/hughmadden/GLM-5.3-Flash-NVFP4-1M-KV-4x-DGX-Spark
-  under <code>exl3-persistence/</code>. Sydney timestamps throughout.</p>
+python3 benchmark/probe_evict_refill.py --n 400 --tokens 9000 --settle 45
+python3 benchmark/probe_200k_restore.py</pre>
+  <p class="muted">Both repositories are listed in §1. Sydney timestamps throughout.</p>
 </section>
 
 <section>
