@@ -79,6 +79,7 @@ cold disk restore beyond the draft window (report §4.2).
 ## Credits
 
 Tony (d2)Wild (TP4 playbook and baseline), Mia AI Lab (EXL3 build and engine lineage),
+brandonmusic (author of the EXL3 TR3 4bpw quantisation recipe this fleet serves),
 Local Inference Labs (Spark builds, LMCache design lineage, the standard benchmark),
 the vLLM project and community (engine + carried fixes). Full attribution in the repo's
 `CREDITS.md`. The persistence tier is Turquoise Bay AI's additive work.
