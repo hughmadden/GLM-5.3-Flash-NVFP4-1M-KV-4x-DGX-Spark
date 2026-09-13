@@ -36,6 +36,14 @@
     {
       "file": "0009-writebehind-evict-only.patch",
       "sha256": "a825d4b3d28ba358cfcfb75685108822b22b7c68b7c5f0a263a605fee1babd6e"
+    },
+    {
+      "file": "0011-pressure-gated-writebehind.patch",
+      "sha256": "ead24ed21fb8c920f4b036c0e43b2984c4b5f37b5931f24a5595878040f7b993"
+    },
+    {
+      "file": "0012-idle-staleness-flush.patch",
+      "sha256": "811f70d76ad938c946c090700b868aac1346e91c4cc00dcd2b68393b0ceb96c2"
     }
   ],
   "files": {
@@ -69,7 +77,7 @@
     },
     "vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py": {
       "before": "f6b4bbde339e4ffa0507392c22af66c5f0ca8266f0980ff2965cd5eeaab525f2",
-      "after": "c61b875a11d4b510255a25f8a489eecb84601c01022cb41bd1303fbfc56bfd2a",
+      "after": "25399de1c61e1b49a98a9b957151af7fd8ae9893d8a8025a636be7c856d5dcf5",
       "anchors": [
         "class TransferJobStatus:"
       ]

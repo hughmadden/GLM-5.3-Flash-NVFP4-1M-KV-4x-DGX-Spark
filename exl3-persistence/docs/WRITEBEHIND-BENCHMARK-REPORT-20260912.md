@@ -79,3 +79,6 @@ scheduler's critical path (fixable: gate tuning toward ~16–32k, a scan
 bound, or a cheap prefilter), half is write-behind copy bandwidth on the
 Sparks' unified memory (structural; paced by the §3.4 dirty-ratio dial).
 Fleet restored to the committed 4096 default after the isolation.
+
+Published (Hugh's explicit ask, 2026-09-12 ~23:45 AEST):
+https://services.turquoisebay.ai/share/glm53-exl3-writebehind/

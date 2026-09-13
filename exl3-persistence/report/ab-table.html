@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OFF vs eager vs write-behind — GLM-5.3-Flash EXL3 TP4 persistence A/B</title>
+<style>
+  :root { --bg:#f7f8fa; --card:#fff; --ink:#1a2330; --muted:#5b6878;
+          --accent:#0d7a8a; --line:#dde3ea; --chip:#e8f4f6; --good:#1a7a3a; --bad:#a33030;
+          --mono:"SF Mono",ui-monospace,Menlo,Consolas,monospace; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#10151c; --card:#171e28; --ink:#e4e9f0; --muted:#93a1b3;
+            --accent:#3fb6c9; --line:#2a3442; --chip:#14343a; --good:#4dbb72; --bad:#e06c6c; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:16px/1.55 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
+  .wrap { max-width:1080px; margin:0 auto; padding:32px 20px 64px; }
+  h1 { font-size:1.5rem; margin:0 0 4px; }
+  .sub { color:var(--muted); margin-bottom:18px; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:10px;
+            padding:22px 24px; margin-top:20px; }
+  h2 { font-size:1.1rem; margin:0 0 12px; color:var(--accent); }
+  .tablewrap { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; font-size:0.92rem; }
+  th,td { border:1px solid var(--line); padding:7px 10px; text-align:right; }
+  th:first-child, td:first-child, td:nth-child(2), th:nth-child(2) { text-align:left; }
+  th { background:var(--chip); }
+  td.wb { font-weight:700; }
+  .good { color:var(--good); font-weight:600; }
+  .bad { color:var(--bad); font-weight:600; }
+  .muted { color:var(--muted); font-size:0.86rem; }
+  code { font-family:var(--mono); font-size:0.85em; background:var(--chip);
+         border-radius:4px; padding:1px 5px; }
+  .note { border-left:3px solid var(--accent); background:var(--chip);
+          padding:8px 14px; margin:12px 0; border-radius:0 6px 6px 0; }
+  footer { color:var(--muted); font-size:0.82rem; margin-top:24px; text-align:center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Persistence A/B: OFF vs eager vs write-behind</h1>
+<div class="sub">GLM-5.3-Flash EXL3 4bpw, TP4 on 4× DGX Spark (GB10) · DFlash2 k=7 · fp8 KV ·
+<code>MAX_NUM_SEQS=4</code>, <code>max_num_batched_tokens=7168</code> · vLLM <code>83252ea899</code> +
+patches 0001–0009 · package 0010 (in-RAM key index + local dispatch) · 2026-09-12</div>
+
+<section>
+  <h2>The three-mode table (prefill and decode, one table)</h2>
+  <div class="tablewrap">
+  <table>
+    <tr><th>Context</th><th>Conc</th><th>Metric</th><th>OFF</th><th>eager (ON)</th><th>write-behind (ON)</th></tr>
+    <tr><td>8k</td><td>1</td><td>prefill tok/s</td><td>1,868</td><td class="bad">1,531</td><td class="wb good">1,868 ¹</td></tr>
+    <tr><td>8k</td><td>1</td><td>decode tok/s</td><td>56.5</td><td>50.5</td><td class="wb">52.5</td></tr>
+    <tr><td>8k</td><td>4</td><td>prefill tok/s</td><td>348</td><td>342</td><td class="wb">324</td></tr>
+    <tr><td>8k</td><td>4</td><td>decode tok/s</td><td>51.5</td><td>52.5</td><td class="wb">50.5</td></tr>
+    <tr><td>64k</td><td>1</td><td>prefill tok/s</td><td>2,028</td><td class="bad">1,531</td><td class="wb good">2,026</td></tr>
+    <tr><td>64k</td><td>1</td><td>decode tok/s</td><td>54.5</td><td class="bad">46.0</td><td class="wb">52.5</td></tr>
+    <tr><td>64k</td><td>4</td><td>prefill tok/s</td><td>733</td><td>675</td><td class="wb">639</td></tr>
+    <tr><td>64k</td><td>4</td><td>decode tok/s</td><td>50.0</td><td class="bad">44.0</td><td class="wb">49.0</td></tr>
+    <tr><td>256k</td><td>1</td><td>prefill tok/s</td><td>1,901</td><td class="bad">1,691</td><td class="wb good">1,919 ²</td></tr>
+    <tr><td>256k</td><td>1</td><td>decode tok/s</td><td>51.0</td><td class="bad">32.5</td><td class="wb">44.5</td></tr>
+    <tr><td>256k</td><td>4</td><td>prefill tok/s</td><td>1,301</td><td class="bad">803</td><td class="wb">757</td></tr>
+    <tr><td>256k</td><td>4</td><td>decode tok/s</td><td>49.0</td><td>48.0</td><td class="wb">44.0</td></tr>
+  </table>
+  </div>
+  <p class="muted">Method: unique salted prompts per cell, streaming TTFT (prefill = prompt tokens ÷ TTFT),
+  200-token decode outputs, median of 2 reps; flusher stopped; engine otherwise idle. WB runs had the
+  tier live (background eviction copies ~159 MB per measurement window). Engine variance ±5–10%.
+  Dedicated decode A/B at 7.5k (ms/step, 8 reps × 200 tok): OFF 90 vs WB 77 — indistinguishable.</p>
+  <div class="note">
+    ¹ post-0010 cell: the 32k lookup gate skips the disk entirely at 8k. Pre-0010 the same cell measured
+    1,462 (−22%) — the lookup tax the in-RAM durable-key index and local-leg dispatch removed (−5% → ~0%).<br>
+    ² this cell served 16,128 tokens from the disk tier mid-prefill (cross-session restore) and still
+    matched OFF.
+  </div>
+  <div class="note">
+    <b>Read:</b> eager (ON) is the configuration that costs — prefill −11…−38%, decode −37% at 256k.
+    write-behind (ON) tracks OFF within noise everywhere; the widest gaps are C=4 prefill (copy backlog
+    sharing the 7,168-token step quantum) and 256k decode (−10–13%, the cell a longer soak would firm up).
+  </div>
+</section>
+
+<section>
+  <h2>Configs behind the columns</h2>
+  <div class="tablewrap">
+  <table>
+    <tr><th style="text-align:left">Setting</th><th style="text-align:left">OFF</th><th style="text-align:left">eager (ON)</th><th style="text-align:left">write-behind (ON)</th></tr>
+    <tr><td style="text-align:left"><code>PERSISTENCE</code></td><td style="text-align:left">off</td><td style="text-align:left">on</td><td style="text-align:left">on</td></tr>
+    <tr><td style="text-align:left"><code>PERSIST_STORE_MODE</code></td><td style="text-align:left">—</td><td style="text-align:left">eager</td><td style="text-align:left">evict_only</td></tr>
+    <tr><td style="text-align:left"><code>PERSIST_MIN_DISK_LOOKUP_TOKENS</code></td><td style="text-align:left">—</td><td style="text-align:left">32,768</td><td style="text-align:left">32,768</td></tr>
+    <tr><td style="text-align:left">store path</td><td style="text-align:left">none</td><td style="text-align:left">request path, synchronous</td><td style="text-align:left">eviction-driven background copies only</td></tr>
+  </table>
+  </div>
+  <p class="muted">Everything else identical across columns (same image, same boot, mode switched by one
+  env edit + restart between arms).</p>
+</section>
+
+<footer>Turquoise Bay AI · Local Inference Lab · 2026-09-12 ·
+full report: https://services.turquoisebay.ai/share/glm53-exl3-writebehind/</footer>
+</div>
+</body>
+</html>

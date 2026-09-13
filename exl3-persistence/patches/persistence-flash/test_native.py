@@ -402,7 +402,9 @@ class CursorTests(unittest.TestCase):
         manager's prepare_store is never consulted."""
         obj, _, _, offered, _ = self.state()
         obj._evict_only = True
+        obj._idle_flush_enabled = False
         bind(obj, OFF+"scheduler.py", "_drain_eviction_queue")
+        bind(obj, OFF+"scheduler.py", "_scan_idle_flush")
         calls = []
         real = obj.manager.prepare_store
         obj.manager.prepare_store = lambda keys, ctx: (calls.append(list(keys)),
@@ -497,6 +499,101 @@ class CursorTests(unittest.TestCase):
         self.assertIn(100, obj._held_evictions)
         self.assertNotIn(101, obj._held_evictions)
         self.assertEqual(obj._eviction_job_blocks[job_id], [100])
+
+    def test_pressure_gate_declines_holds_when_pool_is_empty(self):
+        """0011: with the high watermark set, an idle (empty-pressure)
+        pool declines holds -- nothing is written until memory pressure
+        exists. Below the watermark boundary holds proceed."""
+        obj, _, _, _, _ = self.state()
+        obj._evict_only = True
+        obj._held_evictions = {}
+        obj._eviction_hold_cap = 100
+        obj._eviction_skips = 0
+        obj._eviction_pressure_skips = 0
+        obj._eviction_release_watermark = 8
+        obj._eviction_store_high_watermark = 50
+        env = {"get_block_hash": lambda key: key[:-4],
+               "get_group_id": lambda key: int.from_bytes(key[-4:], "big"),
+               "make_offload_key": extract("vllm/v1/kv_offload/base.py",
+                                           "make_offload_key",
+                                           {"OffloadKey": bytes})}
+        bind(obj, OFF+"scheduler.py", "_defer_evicted_block", env)
+        bh = bytes([9]) * 30 + (0).to_bytes(4, "big")
+
+        deep_pool = NS(get_num_free_blocks=lambda: 100_000)  # idle: way above the gate
+        obj._block_pool = deep_pool
+        self.assertFalse(obj._defer_evicted_block(NS(block_hash=bh, block_id=300)))
+        self.assertEqual(obj._eviction_pressure_skips, 1)
+        self.assertEqual(obj._eviction_skips, 0)
+
+        pressured_pool = NS(get_num_free_blocks=lambda: 10)  # below high watermark
+        obj._block_pool = pressured_pool
+        self.assertTrue(obj._defer_evicted_block(NS(block_hash=bh, block_id=301)))
+        self.assertEqual(obj._eviction_pressure_skips, 1)  # unchanged
+
+        # gate off (0) = 0010 behaviour: holds proceed at any depth
+        obj._eviction_store_high_watermark = 0
+        obj._block_pool = deep_pool
+        self.assertTrue(obj._defer_evicted_block(NS(block_hash=bh, block_id=302)))
+
+    def test_idle_flush_gates_on_staleness_decode_and_rate(self):
+        """0012: stale APC blocks are offered on decode-free steps only,
+        capped per scan, with in-place fenced copies (no holds)."""
+        obj, _, _, _, _ = self.state()
+        obj._evict_only = True
+        obj._idle_flush_enabled = True
+        obj._idle_flush_stale_seconds = 100.0
+        obj._idle_flush_per_scan = 3
+        obj._idle_flush_scan_seconds = 0.0
+        obj._last_flush_scan = 0.0
+        obj._block_last_seen = {}
+        obj.idle_flush_candidates = 0
+        obj.idle_flush_enqueued = 0
+        obj.idle_flush_skipped_fresh = 0
+        obj._held_evictions = {}
+        obj._block_id_to_pending_jobs = {}
+        now = time.monotonic()
+        stale_bid, fresh_bid, unseen_bid = 500, 501, 502
+        obj._block_last_seen[stale_bid] = now - 10_000   # long unseen
+        obj._block_last_seen[fresh_bid] = now            # just seen
+        # pool: two stale-or-unseen cached blocks, one fresh
+        blocks = {b"s" * 30 + (0).to_bytes(4, "big"): {stale_bid: NS(block_id=stale_bid)},
+                  b"t" * 30 + (0).to_bytes(4, "big"): {unseen_bid: NS(block_id=unseen_bid)},
+                  b"u" * 30 + (0).to_bytes(4, "big"): {fresh_bid: NS(block_id=fresh_bid)}}
+        obj._block_pool = NS(cached_block_hash_to_block=NS(_cache=blocks))
+
+        env = {"get_block_hash": lambda key: key[:-4],
+               "get_group_id": lambda key: int.from_bytes(key[-4:], "big"),
+               "make_offload_key": extract("vllm/v1/kv_offload/base.py",
+                                           "make_offload_key",
+                                           {"OffloadKey": bytes}),
+               "GPULoadStoreSpec": lambda ids, **kw: NS(block_ids=ids, **kw),
+               "TransferJobStatus": extract(OFF+"scheduler.py", "TransferJobStatus"),
+               "TransferJob": extract(OFF+"common.py", "TransferJob")}
+        bind(obj, OFF+"scheduler.py", "_scan_idle_flush", env)
+
+        # decode running -> no scan (a request scheduling 1 token/step)
+        busy = NS(num_scheduled_tokens={"r1": 1})
+        self.assertEqual(obj._scan_idle_flush(busy), {})
+        self.assertEqual(obj.idle_flush_enqueued, 0)
+
+        # decode-free -> stale+unseen admitted (capped at per_scan=2),
+        # fresh skipped; copies fenced, nothing held
+        real = obj.manager.prepare_store
+        def prepare(keys, ctx):
+            out = real(keys, ctx)
+            out.skipped_keys = []
+            return out
+        obj.manager.prepare_store = prepare
+        free = NS(num_scheduled_tokens={})
+        jobs = obj._scan_idle_flush(free)
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(obj.idle_flush_candidates, 2)
+        self.assertEqual(obj.idle_flush_skipped_fresh, 1)
+        self.assertEqual(obj._held_evictions, {})
+        job_id = next(iter(jobs))
+        self.assertIn(job_id, obj._block_id_to_pending_jobs.get(stale_bid, set())
+                      | obj._block_id_to_pending_jobs.get(unseen_bid, set()))
 
     def test_native_cpu_policy_skips_not_pending_writes(self):
         prepare = extract("vllm/v1/kv_offload/cpu/manager.py", "prepare_store", {"PrepareStoreOutput": lambda **kw: NS(**kw)})

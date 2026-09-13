@@ -103,6 +103,9 @@ def main():
     ap.add_argument("--tokens", type=int, default=9000, help="approx prompt tokens")
     ap.add_argument("--conc", type=int, default=4)
     ap.add_argument("--max-tokens", type=int, default=8)
+    ap.add_argument("--settle", type=int, default=0,
+                    help="seconds to wait between phase 0 and phase 1 so the "
+                         "finish-drain store lands before the repeat probes it")
     a = ap.parse_args()
 
     target = filler("TARGET", a.tokens)
@@ -113,7 +116,11 @@ def main():
           f"prefix_hits={delta(r0,'vllm:prefix_cache_hits_total'):.0f}  "
           f"store_B={delta(r0,'vllm:kv_offload_store_bytes_total'):.0f}")
 
-    print("=== phase 1: immediate repeat (should be served from a cache) ===")
+    if a.settle:
+        print(f"--- settling {a.settle}s for the finish-drain store ---")
+        time.sleep(a.settle)
+
+    print("=== phase 1: repeat after settle (should be served from a cache) ===")
     r1 = timed(a.url, a.model, target, a.max_tokens)
     print(f"  warm: {r1['seconds']:.2f} s  "
           f"prefix_hits={delta(r1,'vllm:prefix_cache_hits_total'):.0f}  "
