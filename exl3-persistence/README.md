@@ -13,7 +13,7 @@ Full measured report: https://services.turquoisebay.ai/share/glm53-exl3-writebeh
 
 | Path | What it is |
 |---|---|
-| `patches/persistence-flash/` | The engine patch series `0001-0012` (hash-pinned `manifest.json`, `apply.py check/apply/verify`, AST suite `test_native.py`) applied to vLLM `83252ea899` at image build |
+| `patches/persistence-flash/` | The engine patch series `0001-0013` (hash-pinned `manifest.json`, `apply.py check/apply/verify`, AST suite `test_native.py`) applied to vLLM `83252ea899` at image build |
 | `persistence/recipe_persistence/` | The out-of-tree spec + store + coordinator package (bind-mounts over dist-packages; ships by rsync + process restart) |
 | `configs/` | The launch environment and fleet launcher (`PERSIST_*` knobs) |
 | `benchmark/` | Every probe used in the report (`bench_c1c6.py` the Local Inference Labs standard, `ab_matrix.py`, `probe_prefill_tax.py`, `probe_evict_refill.py`, `probe_session_restore.py`, `probe_pressure_tax.py`, `probe_200k_restore.py`) |
@@ -59,6 +59,11 @@ Full measured report: https://services.turquoisebay.ai/share/glm53-exl3-writebeh
   coordinator leg. Took the residual prefill tax from -12% to ~0%.
 - **0011** the pressure gate: an idle pool writes nothing.
 - **0012** the idle-time staleness flusher: stale APC content lands on disk during
+  decode-free steps, in-place, fenced - durability without memory pressure and zero
+  decode cost by construction.
+- **0013** removes the retired eager store path (the 339-line request-path walk,
+  finish-hold, partial-tail builder, frontier helpers): evict-only is now the only
+  code path.
   decode-free steps, in-place, fenced - durability without memory pressure and zero
   decode cost by construction.
 

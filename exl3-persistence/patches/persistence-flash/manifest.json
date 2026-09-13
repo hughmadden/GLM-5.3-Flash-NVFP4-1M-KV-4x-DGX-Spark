@@ -44,6 +44,10 @@
     {
       "file": "0012-idle-staleness-flush.patch",
       "sha256": "811f70d76ad938c946c090700b868aac1346e91c4cc00dcd2b68393b0ceb96c2"
+    },
+    {
+      "file": "0013-remove-eager-code.patch",
+      "sha256": "4993300ed3d3a4e6198a43bed79272fefba29e3f707113def248c9eabcd398c5"
     }
   ],
   "files": {
@@ -77,7 +81,7 @@
     },
     "vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py": {
       "before": "f6b4bbde339e4ffa0507392c22af66c5f0ca8266f0980ff2965cd5eeaab525f2",
-      "after": "25399de1c61e1b49a98a9b957151af7fd8ae9893d8a8025a636be7c856d5dcf5",
+      "after": "42fac83c321192fa037adb4be78657a00c597ba5083ad28424319858dbc2018e",
       "anchors": [
         "class TransferJobStatus:"
       ]
